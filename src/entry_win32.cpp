@@ -127,7 +127,7 @@ struct LoadGLTFResult {
 
 struct GLTFBuffer {
     u32 len;
-    void* data;
+    void* memory;
 };
 
 struct GLTFBufferView {
@@ -152,6 +152,58 @@ struct GLTFAccessor {
     u32 count;
     int component_count;
 };
+
+struct DecodeBase64Result {
+    u32 size;
+    void* memory;
+};
+
+
+internal DecodeBase64Result decode_base64(Arena* arena, char *in)
+{
+    // Taken from https://nachtimwald.com/2017/11/18/base64-encode-and-decode-in-c/
+
+	u64 in_len = strlen(in);
+
+    u64 out_len = in_len / 4 * 3;
+	for (u64 i=in_len; i-->0; ) {
+		if (in[i] == '=') {
+			out_len--;
+		} else {
+			break;
+		}
+	}
+    
+    int b64invs[] = {
+        62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58,
+        59, 60, 61, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5,
+        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28,
+        29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+        43, 44, 45, 46, 47, 48, 49, 50, 51
+    };
+
+    char* out = (char*)arena_push(arena, out_len);
+
+	for (u64 i=0, j=0; i<in_len; i+=4, j+=3) {
+		int v = b64invs[in[i]-43];
+		v = (v << 6) | b64invs[in[i+1]-43];
+		v = in[i+2]=='=' ? v << 6 : (v << 6) | b64invs[in[i+2]-43];
+		v = in[i+3]=='=' ? v << 6 : (v << 6) | b64invs[in[i+3]-43];
+
+		out[j] = (v >> 16) & 0xFF;
+		if (in[i+2] != '=')
+			out[j+1] = (v >> 8) & 0xFF;
+		if (in[i+3] != '=')
+			out[j+2] = v & 0xFF;
+	}
+
+    DecodeBase64Result result;
+    result.size = (u32)out_len;
+    result.memory = out;
+    
+    return result;
+}
 
 internal LoadGLTFResult load_gltf(Arena* arena, Renderer* renderer, char* path) {
     Scratch scratch = get_scratch(&arena, 1);
@@ -187,15 +239,23 @@ internal LoadGLTFResult load_gltf(Arena* arena, Renderer* renderer, char* path) 
     JSON_FOREACH(json_query(root, "buffers"), src_buf) {
         GLTFBuffer* buf = &buffers[num_buffers++];
         buf->len = (u32)json_query(src_buf, "byteLength")->number;
-        
+
+        char* base64_header = "data:application/octet-stream;base64,";
         char* uri = json_query(src_buf, "uri")->string;
 
-        char absolute_uri[MAX_PATH + 1];
-        snprintf(absolute_uri, sizeof(absolute_uri), "%s%s", dir, uri);
-        ReadFileResult buf_file = read_file(scratch.arena, absolute_uri);
+        if (strncmp(uri, base64_header, strlen(base64_header)) == 0) {
+            DecodeBase64Result decode = decode_base64(scratch.arena, uri + strlen(base64_header));
+            assert(decode.size == buf->len);
+            buf->memory = decode.memory;
+        }
+        else {
+            char absolute_uri[MAX_PATH + 1];
+            snprintf(absolute_uri, sizeof(absolute_uri), "%s%s", dir, uri);
+            ReadFileResult buf_file = read_file(scratch.arena, absolute_uri);
 
-        assert(buf_file.size == buf->len);
-        buf->data = buf_file.memory;
+            assert(buf_file.size == buf->len);
+            buf->memory = buf_file.memory;
+        }
     }
 
     Json* asset_views = json_query(root, "bufferViews");
@@ -287,10 +347,10 @@ internal LoadGLTFResult load_gltf(Arena* arena, Renderer* renderer, char* path) 
             Vertex* vertex_data = arena_push_array(prim_scratch.arena, Vertex, vertex_count);
             u32* index_data = arena_push_array(prim_scratch.arena, u32, index_count);
 
-            f32* pos_src = (f32*)((u8*)pos_accessor->view->buffer->data + pos_accessor->view->offset + pos_accessor->offset);
-            f32* norm_src = (f32*)((u8*)norm_accessor->view->buffer->data + norm_accessor->view->offset + norm_accessor->offset);
-            f32* uv_src = (f32*)((u8*)uv_accessor->view->buffer->data + uv_accessor->view->offset + uv_accessor->offset);
-            void* index_src = (u8*)indices_accessor->view->buffer->data + indices_accessor->view->offset + indices_accessor->offset;
+            f32* pos_src = (f32*)((u8*)pos_accessor->view->buffer->memory + pos_accessor->view->offset + pos_accessor->offset);
+            f32* norm_src = (f32*)((u8*)norm_accessor->view->buffer->memory + norm_accessor->view->offset + norm_accessor->offset);
+            f32* uv_src = (f32*)((u8*)uv_accessor->view->buffer->memory + uv_accessor->view->offset + uv_accessor->offset);
+            void* index_src = (u8*)indices_accessor->view->buffer->memory + indices_accessor->view->offset + indices_accessor->offset;
 
             for (u32 i = 0; i < vertex_count; ++i) {
                 Vertex* v = &vertex_data[i];
