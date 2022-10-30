@@ -67,7 +67,9 @@ Scratch get_scratch(Arena** conflicts, u32 conflict_count) {
 }
 
 void release_scratch(Scratch scratch) {
-    scratch.arena->cursor = scratch.ptr;
+    if (scratch.ptr < scratch.arena->cursor) {
+        scratch.arena->cursor = scratch.ptr;
+    }
 }
 
 ReadFileResult read_file(Arena* arena, char* path) {
