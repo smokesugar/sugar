@@ -16,17 +16,13 @@ struct StringJsonPair;
 struct Json {
     Json* next;
     JsonType type;
-    #if NDEBUG
     union {
-    #endif
         f32 number;
         char* string;
         b32 boolean;
         Json* array_first;
         StringJsonPair* object_first;
-    #if NDEBUG
     };
-    #endif
 };
 
 struct StringJsonPair {
