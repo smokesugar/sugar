@@ -152,8 +152,25 @@ internal Json* parse(Arena* arena, Lexer* l) {
             return j;
         }
         case TOKEN_NUMBER: {
-            Json* j = new_json(arena, JSON_NUMBER);
-            j->number = strtof(tok.ptr, 0);
+            bool has_decimal = false;
+            for (int i = 0; i < tok.len; ++i) {
+                if (tok.ptr[i] == '.') {
+                    has_decimal = true;
+                    break;
+                }
+            };
+
+            Json* j = 0;
+
+            if (has_decimal) {
+                j = new_json(arena, JSON_REAL);
+                j->real = strtod(tok.ptr, 0);
+            }
+            else {
+                j = new_json(arena, JSON_INTEGER);
+                j->integer = strtoll(tok.ptr, 0, 10);
+            }
+            
             return j;
         }
         case TOKEN_STRING: {

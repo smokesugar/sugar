@@ -1,6 +1,8 @@
 /.vs/
 /target/
 
+/data/models/
+
 *.sln
 *.vcxproj
 *.user

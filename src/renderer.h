@@ -19,12 +19,12 @@ void renderer_release_backend(Renderer* r);
 
 void renderer_handle_resize(Renderer* r, u32 width, u32 height);
 
-struct MeshSubmission {
+struct MeshInstance {
     Mesh mesh;
     XMMATRIX transform;
 };
 
-void renderer_render_frame(Renderer* r, MeshSubmission* queue, u32 queue_len);
+void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len);
 
 struct Vertex {
     XMFLOAT3 pos;

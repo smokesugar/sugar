@@ -4,7 +4,8 @@
 
 enum JsonType {
     JSON_NULL,
-    JSON_NUMBER,
+    JSON_REAL,
+    JSON_INTEGER,
     JSON_STRING,
     JSON_BOOLEAN,
     JSON_ARRAY,
@@ -17,7 +18,8 @@ struct Json {
     Json* next;
     JsonType type;
     union {
-        f32 number;
+        f64 real;
+        i64 integer;
         char* string;
         b32 boolean;
         Json* array_first;

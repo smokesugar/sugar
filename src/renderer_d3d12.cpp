@@ -692,7 +692,7 @@ internal MeshData* get_mesh_data(Renderer* r, Mesh handle) {
     return &r->mesh_data[handle.index];
 }
 
-void renderer_render_frame(Renderer* r, MeshSubmission* queue, u32 queue_len) {
+void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len) {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     r->swapchain->GetDesc1(&swapchain_desc);
 
@@ -741,7 +741,7 @@ void renderer_render_frame(Renderer* r, MeshSubmission* queue, u32 queue_len) {
     cmd.list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
 
     for (u32 i = 0; i < queue_len; ++i) {
-        MeshSubmission* mesh_sub = &queue[i];
+        MeshInstance* mesh_sub = &queue[i];
         MeshData* mesh_data = get_mesh_data(r, mesh_sub->mesh);
 
         ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &mesh_sub->transform, sizeof(mesh_sub->transform));

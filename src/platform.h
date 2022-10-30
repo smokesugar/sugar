@@ -21,3 +21,4 @@ struct ReadFileResult {
 };
 
 ReadFileResult read_file(Arena* arena, char* path);
+void write_file(char* path, void* data, u64 size);
