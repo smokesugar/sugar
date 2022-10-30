@@ -11,6 +11,7 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 
 #define MAX_COMMAND_LIST_COUNT 16
 #define MAX_RTV_COUNT 1024
+#define MAX_DSV_COUNT 1024
 #define BINDLESS_HEAP_CAPACITY 1000000
 
 #define CONSTANT_BUFFER_SIZE 256
@@ -163,6 +164,7 @@ struct Renderer {
     u64 fence_counter;
 
     DescriptorHeap rtv_heap;
+    DescriptorHeap dsv_heap;
     DescriptorHeap bindless_heap;
 
     ID3D12RootSignature* root_signature;
@@ -182,6 +184,8 @@ struct Renderer {
     ReleasableResource* releasable_resource_list;
 
     ID3D12PipelineState* pipeline;
+    ID3D12Resource* depth_buffer;
+    Descriptor depth_view;
 
     int num_free_meshes;
     u32 mesh_free_list[MESH_MEMORY_COUNT];
@@ -365,6 +369,29 @@ internal IDxcBlob* compile_shader(char* path, char* entry, char* target) {
     }
 }
 
+internal void create_depth_buffer(Renderer* r, u32 width, u32 height) {
+    D3D12_RESOURCE_DESC resource_desc = {};
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resource_desc.Width = width;
+    resource_desc.Height = height;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 1;
+    resource_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, 0, IID_PPV_ARGS(&r->depth_buffer));
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+
+    r->device->CreateDepthStencilView(r->depth_buffer, &dsv_desc, cpu_descriptor_handle(&r->dsv_heap, r->depth_view));
+}
+
 Renderer* renderer_init(Arena* arena, void* window) {
     Renderer* r = arena_push_struct_zero(arena, Renderer);
 
@@ -429,7 +456,8 @@ Renderer* renderer_init(Arena* arena, void* window) {
     r->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&r->fence));
 
     r->rtv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, MAX_RTV_COUNT, false, 1);
-    r->bindless_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, BINDLESS_HEAP_CAPACITY, true, 2);
+    r->dsv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, MAX_DSV_COUNT, false, 2);
+    r->bindless_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, BINDLESS_HEAP_CAPACITY, true, 3);
 
     D3D12_ROOT_PARAMETER root_param = {};
     root_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -502,14 +530,13 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     pso_desc.DepthStencilState.DepthEnable = TRUE;
     pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
 
     pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 
     pso_desc.NumRenderTargets = 1;
     pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-    pso_desc.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    pso_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
 
     pso_desc.SampleDesc.Count = 1;
 
@@ -517,6 +544,9 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     vs->Release();
     ps->Release();
+
+    r->depth_view = alloc_descriptor(&r->dsv_heap);
+    create_depth_buffer(r, swapchain_desc.Width, swapchain_desc.Height);
 
     for (int i = 0; i < MESH_MEMORY_COUNT; ++i) {
         r->mesh_free_list[r->num_free_meshes++] = i;
@@ -548,6 +578,7 @@ void renderer_release_backend(Renderer* r) {
         }
     }
 
+    r->depth_buffer->Release();
     r->pipeline->Release();
 
     for (ReleasableResource* n = r->releasable_resource_list; n; n = n->next) {
@@ -564,6 +595,7 @@ void renderer_release_backend(Renderer* r) {
     r->root_signature->Release();
 
     r->bindless_heap.heap->Release();
+    r->dsv_heap.heap->Release();
     r->rtv_heap.heap->Release();
 
     r->fence->Release();
@@ -585,6 +617,9 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
     release_swapchain_buffers(r);
     r->swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
     get_swapchain_buffers_and_create_rtvs(r);
+
+    r->depth_buffer->Release();
+    create_depth_buffer(r, width, height);
 
     debug_message("Resized swapchain (%d x %d)\n", width, height);
 }
@@ -676,9 +711,12 @@ void renderer_render_frame(Renderer* r, MeshSubmission* queue, u32 queue_len) {
     cmd.list->ResourceBarrier(1, &barrier);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = cpu_descriptor_handle(&r->rtv_heap, r->swapchain_rtvs[swapchain_index]);
-    f32 clear_color[4] = { 0.2f, 0.3f, 0.3f, 1.0f };
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = cpu_descriptor_handle(&r->dsv_heap, r->depth_view);
+
+    f32 clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
     cmd.list->ClearRenderTargetView(rtv_handle, clear_color, 0, 0);
-    cmd.list->OMSetRenderTargets(1, &rtv_handle, false, 0);
+    cmd.list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, 0);
+    cmd.list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle);
 
     D3D12_RECT scissor = {};
     scissor.right = swapchain_desc.Width;
@@ -695,8 +733,8 @@ void renderer_render_frame(Renderer* r, MeshSubmission* queue, u32 queue_len) {
     cmd.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmd.list->SetPipelineState(r->pipeline);
 
-    XMMATRIX view_matrix = XMMatrixLookAtRH({ sinf(engine_time() * PI32) * 2.0f, 0.0f, 3.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
-    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(PI32 * 0.25f, (f32)swapchain_desc.Width / (f32)swapchain_desc.Height, 0.1f, 1000.0f);
+    XMMATRIX view_matrix = XMMatrixLookAtRH({ 0.0f, 0.0f, 3.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
+    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(PI32 * 0.25f, (f32)swapchain_desc.Width / (f32)swapchain_desc.Height, 1000.0f, 0.1f);
     XMMATRIX view_projection = view_matrix * projection_matrix;
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
     drop_constant_buffer(&cmd, camera_cbuffer);

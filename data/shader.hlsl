@@ -40,5 +40,15 @@ VSOut vs_main(uint vertex_id : SV_VertexID) {
 
 float4 ps_main(VSOut vso) : SV_Target{
     float3 normal = normalize(vso.normal);
-    return float4(sqrt(normal * 0.5f + 0.5f), 1.0f);
+    float3 light_dir = normalize(float3(1.0f, 3.0f, 3.0f));
+
+    float3 diffuse_color = 1.0f.xxx;
+    float3 diffuse = max(dot(light_dir, normal), 0.0f) * diffuse_color;
+
+    float3 ambient = 0.01f.xxx;
+
+    float3 lighting = ambient + diffuse;
+
+    float3 tonemapped_output = sqrt(lighting);
+    return float4(tonemapped_output, 1.0f);
 }

@@ -466,9 +466,11 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
         MeshSubmission* queue = arena_push_array(&frame_arena, MeshSubmission, gltf.num_meshes);
 
+        f32 time = engine_time();
+
         for (u32 i = 0; i < gltf.num_meshes; ++i) {
             queue[i].mesh = gltf.mesh_memory[i];
-            queue[i].transform = XMMatrixIdentity();
+            queue[i].transform = XMMatrixRotationRollPitchYaw(0.0f, time * PI32, 0.0f);
         }
 
         renderer_render_frame(renderer, queue, gltf.num_meshes);
