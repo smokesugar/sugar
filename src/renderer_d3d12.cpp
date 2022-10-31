@@ -140,6 +140,7 @@ struct CommandQueue {
 struct CommandList {
     CommandList* next;
     u64 fence_val;
+    D3D12_COMMAND_LIST_TYPE type;
     CommandQueue* queue;
     ID3D12CommandAllocator* allocator;
     ID3D12GraphicsCommandList* list;
@@ -199,11 +200,14 @@ internal void command_queue_flush(CommandQueue* queue) {
 struct Renderer {
     Arena arena;
 
+    ReleasableResource* releasable_resource_slots;
+
     IDXGIFactory3* factory;
     IDXGIAdapter* adapter;
     ID3D12Device* device;
 
     CommandQueue direct_queue;
+    CommandQueue copy_queue;
 
     DescriptorHeap rtv_heap;
     DescriptorHeap dsv_heap;
@@ -221,7 +225,9 @@ struct Renderer {
     CommandList* available_command_lists;
     CommandList* executing_command_lists;
 
-    ReleasableResource* releasable_resource_list;
+    #if _DEBUG
+    ReleasableResource* garbage;
+    #endif
 
     ID3D12PipelineState* pipeline;
     ID3D12Resource* depth_buffer;
@@ -266,29 +272,43 @@ internal void update_available_command_lists(Renderer* r) {
     }
 }
 
-internal CommandList* open_command_list(Renderer* r) {
+internal CommandList* open_command_list(Renderer* r, D3D12_COMMAND_LIST_TYPE type) {
     update_available_command_lists(r);
 
-    if (!r->available_command_lists) {
-        CommandList* cmd = arena_push_struct_zero(&r->arena, CommandList);
+    CommandList* found = 0;
 
-        r->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd->allocator));
-        r->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd->allocator, 0, IID_PPV_ARGS(&cmd->list));
-        cmd->list->Close();
-
-        debug_message("Allocated a command list.\n");
-
-        r->available_command_lists = cmd;
+    for (CommandList** p_cmd = &r->available_command_lists; *p_cmd;) {
+        CommandList* cmd = *p_cmd;
+        if (cmd->type == type) {
+            *p_cmd = cmd->next;
+            found = cmd;
+            break;
+        }
+        else {
+            p_cmd = &cmd->next;
+        }
     }
 
-    CommandList* cmd = r->available_command_lists;
-    r->available_command_lists = cmd->next;
+    if (!found) {
+        found = arena_push_struct_zero(&r->arena, CommandList);
+
+        found->type = type;
+        r->device->CreateCommandAllocator(type, IID_PPV_ARGS(&found->allocator));
+        r->device->CreateCommandList(0, type, found->allocator, 0, IID_PPV_ARGS(&found->list));
+        found->list->Close();
+
+        debug_message("Allocated a command list.\n");
+    }
+
+    CommandList* cmd = found;
 
     cmd->allocator->Reset();
     cmd->list->Reset(cmd->allocator, 0);
 
-    cmd->list->SetGraphicsRootSignature(r->root_signature);
-    cmd->list->SetDescriptorHeaps(1, &r->bindless_heap.heap);
+    if (cmd->type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        cmd->list->SetGraphicsRootSignature(r->root_signature);
+        cmd->list->SetDescriptorHeaps(1, &r->bindless_heap.heap);
+    }
 
     return cmd;
 }
@@ -484,6 +504,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 
     r->direct_queue = command_queue_init(r->device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    r->copy_queue = command_queue_init(r->device, D3D12_COMMAND_LIST_TYPE_COPY);
 
     r->rtv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, MAX_RTV_COUNT, false, 1);
     r->dsv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, MAX_DSV_COUNT, false, 2);
@@ -592,6 +613,7 @@ void renderer_release_backend(Renderer* r) {
     UNUSED(r);
 #if _DEBUG
     command_queue_flush(&r->direct_queue);
+    command_queue_flush(&r->copy_queue);
 
     update_available_command_lists(r);
     assert(!r->executing_command_lists);
@@ -611,9 +633,11 @@ void renderer_release_backend(Renderer* r) {
     r->depth_buffer->Release();
     r->pipeline->Release();
 
-    for (ReleasableResource* n = r->releasable_resource_list; n; n = n->next) {
-        r->releasable_resource_list->resource->Release();
+    #if _DEBUG
+    for (ReleasableResource* n = r->garbage; n; n = n->next) {
+        n->resource->Release();
     }
+    #endif
 
     for (int i = 0; i < DXGI_MAX_SWAP_CHAIN_BUFFERS; ++i) {
         free_descriptor(&r->rtv_heap, r->swapchain_rtvs[i]);
@@ -628,6 +652,7 @@ void renderer_release_backend(Renderer* r) {
     r->dsv_heap.heap->Release();
     r->rtv_heap.heap->Release();
 
+    command_queue_release(&r->copy_queue);
     command_queue_release(&r->direct_queue);
 
     r->device->Release();
@@ -653,6 +678,28 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
     debug_message("Resized swapchain (%d x %d)\n", width, height);
 }
 
+internal void append_releasable_resource(Renderer* r, ID3D12Resource* resource, ReleasableResource** target) {
+    ReleasableResource* rr;
+
+    if (!r->releasable_resource_slots) {
+        rr = arena_push_struct_zero(&r->arena, ReleasableResource);
+    }
+    else {
+        rr = r->releasable_resource_slots;
+        r->releasable_resource_slots = rr->next;
+    }
+
+    rr->resource = resource;
+    rr->next = *target;
+    *target = rr;
+}
+
+internal void release_releasable_resource(Renderer* r, ReleasableResource* rr) {
+    rr->resource->Release();
+    rr->next = r->releasable_resource_slots;
+    r->releasable_resource_slots = rr;
+}
+
 internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_size) {
     if (!r->available_constant_buffer_list) {
         debug_message("Creating a constant buffer pool (%d constant buffers)\n", CONSTANT_BUFFER_POOL_SIZE);
@@ -672,11 +719,9 @@ internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_s
         ID3D12Resource* resource;
         r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&resource));
 
-        ReleasableResource* releasable_resource = arena_push_struct(&r->arena, ReleasableResource);
-        releasable_resource->next = r->releasable_resource_list;
-        releasable_resource->resource = resource;
-
-        r->releasable_resource_list = releasable_resource;
+        #if _DEBUG
+        append_releasable_resource(r, resource, &r->garbage);
+        #endif
 
         void* base;
         resource->Map(0, 0, &base);
@@ -728,7 +773,7 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     u32 swapchain_index = r->swapchain->GetCurrentBackBufferIndex();
     command_queue_wait(&r->direct_queue, r->swapchain_fences[swapchain_index]);
 
-    CommandList* cmd = open_command_list(r);
+    CommandList* cmd = open_command_list(r, D3D12_COMMAND_LIST_TYPE_DIRECT);
 
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -794,7 +839,49 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     r->swapchain_fences[swapchain_index] = command_queue_signal(&r->direct_queue);
 }
 
-Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
+struct RendererUploadContext {
+    CommandList* cmd;
+    ReleasableResource* releasable_resources;
+};
+
+struct RendererUploadTicket {
+    u64 fence_val;
+    ReleasableResource* releasable_resources;
+};
+
+RendererUploadContext* renderer_open_upload_context(Arena* arena, Renderer* r) {
+    RendererUploadContext* context = arena_push_struct(arena, RendererUploadContext);
+    context->cmd = open_command_list(r, D3D12_COMMAND_LIST_TYPE_COPY);
+    return context;
+}
+
+RendererUploadTicket* renderer_submit_upload_context(Arena* arena, Renderer* r, RendererUploadContext* context) {
+    submit_command_list(r, &r->copy_queue, context->cmd);
+    RendererUploadTicket* ticket = arena_push_struct(arena, RendererUploadTicket);
+    ticket->fence_val = command_queue_signal(&r->copy_queue);
+    ticket->releasable_resources = context->releasable_resources;
+    return ticket;
+}
+
+bool renderer_upload_finished(Renderer* r, RendererUploadTicket* ticket) {
+    bool result = command_queue_reached(&r->copy_queue, ticket->fence_val);
+
+    if (result) {
+        for (ReleasableResource* n = ticket->releasable_resources; n;) {
+            ReleasableResource* next = n->next;
+            release_releasable_resource(r, n);
+            n = next;
+        }
+
+        ticket->releasable_resources = 0;
+    }
+
+    return result;
+}
+
+Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
+    UNUSED(upload_context);
+
     assert(r->num_free_meshes > 0);
 
     u32 index = r->mesh_free_list[--r->num_free_meshes];
@@ -804,6 +891,8 @@ Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* 
 
     MeshData* data = &r->mesh_data[index];
 
+    ID3D12Resource* staging_vbuffer, *staging_ibuffer;
+
     D3D12_RESOURCE_DESC resource_desc = {};
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     resource_desc.Height = 1;
@@ -812,24 +901,32 @@ Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* 
     resource_desc.SampleDesc.Count = 1;
     resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    D3D12_HEAP_PROPERTIES heap_props = {};
-    heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_PROPERTIES upload_heap_props = {};
+    upload_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_HEAP_PROPERTIES default_heap_props = {};
+    default_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     resource_desc.Width = vertex_data_size;
-    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&data->vbuffer));
+    r->device->CreateCommittedResource(&upload_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&staging_vbuffer));
+    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->vbuffer));
 
     resource_desc.Width = index_data_size;
-    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&data->ibuffer));
+    r->device->CreateCommittedResource(&upload_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&staging_ibuffer));
+    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->ibuffer));
 
     void* mapped_ptr;
 
-    data->vbuffer->Map(0, 0, &mapped_ptr);
+    staging_vbuffer->Map(0, 0, &mapped_ptr);
     memcpy(mapped_ptr, vertex_data, vertex_data_size);
-    data->vbuffer->Unmap(0, 0);
+    staging_vbuffer->Unmap(0, 0);
     
-    data->ibuffer->Map(0, 0, &mapped_ptr);
+    staging_ibuffer->Map(0, 0, &mapped_ptr);
     memcpy(mapped_ptr, index_data, index_data_size);
-    data->ibuffer->Unmap(0, 0);
+    staging_ibuffer->Unmap(0, 0);
+
+    upload_context->cmd->list->CopyBufferRegion(data->vbuffer, 0, staging_vbuffer, 0, vertex_data_size);
+    upload_context->cmd->list->CopyBufferRegion(data->ibuffer, 0, staging_ibuffer, 0, index_data_size);
 
     data->vbuffer_view = alloc_descriptor(&r->bindless_heap);
     data->ibuffer_view = alloc_descriptor(&r->bindless_heap);
@@ -847,6 +944,9 @@ Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* 
     r->device->CreateShaderResourceView(data->ibuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, data->ibuffer_view));
 
     data->index_count = index_count;
+
+    append_releasable_resource(r, staging_vbuffer, &upload_context->releasable_resources);
+    append_releasable_resource(r, staging_ibuffer, &upload_context->releasable_resources);
 
     Mesh handle = {};
     handle.index = index;

@@ -31,10 +31,17 @@ struct Camera {
 
 void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len);
 
+struct RendererUploadContext;
+struct RendererUploadTicket;
+
+RendererUploadContext* renderer_open_upload_context(Arena* arena, Renderer* r);
+RendererUploadTicket* renderer_submit_upload_context(Arena* arena, Renderer* r, RendererUploadContext* context);
+bool renderer_upload_finished(Renderer* r, RendererUploadTicket* ticket);
+
 struct Vertex {
     XMFLOAT3 pos;
     XMFLOAT3 norm;
     XMFLOAT2 uv;
 };
 
-Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count);
+Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count);

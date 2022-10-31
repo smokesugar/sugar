@@ -239,7 +239,7 @@ internal XMVECTOR extract_json_vector(Json* j) {
     return result;
 }
 
-internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, Json* root, GLTFBuffer* buffers, u32 num_buffers) {
+internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, Json* root, GLTFBuffer* buffers, u32 num_buffers) {
     UNUSED(num_buffers);
 
     Scratch scratch = get_scratch(&arena, 1);
@@ -379,7 +379,7 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, Json* roo
             }
 
             Mesh* prim = &mesh->primitives[primitive_index++];
-            *prim = renderer_new_mesh(renderer, vertex_data, vertex_count, index_data, index_count);
+            *prim = renderer_new_mesh(renderer, upload_context, vertex_data, vertex_count, index_data, index_count);
 
             release_scratch(prim_scratch);
         }
@@ -471,7 +471,7 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, Json* roo
     return result;
 }
 
-internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, char* path) {
+internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* path) {
     Scratch scratch = get_scratch(&arena, 1);
 
     assert(strcmp(strrchr(path, '.'), ".glb") == 0);
@@ -517,7 +517,7 @@ internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, char* pa
     Json* root = parse_json_string(scratch.arena, json_string);
     Json* ahd = json_query(root, "buffers");
     UNUSED(ahd);
-    LoadGLTFResult result = process_gltf(arena, renderer, root, buffers, num_buffers);
+    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, root, buffers, num_buffers);
         
     release_scratch(scratch_2);
     release_scratch(scratch);
@@ -576,7 +576,7 @@ internal DecodeBase64Result decode_base64(Arena* arena, char *in)
     return result;
 }
 
-internal LoadGLTFResult load_gltf_gltf(Arena* arena, Renderer* renderer, char* path) {
+internal LoadGLTFResult load_gltf_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* path) {
     Scratch scratch = get_scratch(&arena, 1);
 
     assert(strcmp(strrchr(path, '.'), ".gltf") == 0);
@@ -630,23 +630,23 @@ internal LoadGLTFResult load_gltf_gltf(Arena* arena, Renderer* renderer, char* p
         }
     }
 
-    LoadGLTFResult result = process_gltf(arena, renderer, root, buffers, num_buffers);
+    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, root, buffers, num_buffers);
 
     release_scratch(scratch);
 
     return result;
 };
 
-internal LoadGLTFResult load_gltf(Arena* arena, Renderer* renderer, char* path) {
+internal LoadGLTFResult load_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* path) {
     char* extension = strrchr(path, '.');
     assert(extension);
     
     if (strcmp(extension, ".gltf") == 0) {
-        return load_gltf_gltf(arena, renderer, path);
+        return load_gltf_gltf(arena, renderer, upload_context, path);
     }
 
     if (strcmp(extension, ".glb") == 0) {
-        return load_gltf_glb(arena, renderer, path);
+        return load_gltf_glb(arena, renderer, upload_context, path);
     }
 
     system_message_box("Invalid GLTF file:\n'%s'", path);
@@ -701,7 +701,10 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     Arena frame_arena = arena_init(page_alloc(frame_arena_size), frame_arena_size);
 
     Renderer* renderer = renderer_init(&perm_arena, window);
-    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, "models/as-val.glb");
+
+    RendererUploadContext* upload_context = renderer_open_upload_context(&perm_arena, renderer);
+    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, upload_context, "models/as-val.glb");
+    RendererUploadTicket* upload_ticket = renderer_submit_upload_context(&perm_arena, renderer, upload_context);
 
     for (u32 i = 0; i < gltf.num_instances; ++i) {
         gltf.instances[i].transform *= XMMatrixScaling(0.4f, 0.4f, 0.4f);
@@ -741,7 +744,16 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         camera.transform = XMMatrixTranslation(0.0f, 0.0f, 5.0f);
         camera.fov = PI32 * 0.5f;
 
-        renderer_render_frame(renderer, &camera, gltf.instances, gltf.num_instances);
+        MeshInstance* queue = 0;
+        int queue_len = 0;
+
+        if (renderer_upload_finished(renderer, upload_ticket)) {
+            queue = arena_push_array(&frame_arena, MeshInstance, gltf.num_instances);
+            memcpy(queue, gltf.instances, gltf.num_instances * sizeof(MeshInstance));
+            queue_len = gltf.num_instances;
+        }
+
+        renderer_render_frame(renderer, &camera, queue, queue_len);
     }
 
     renderer_release_backend(renderer);
