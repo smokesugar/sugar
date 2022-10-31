@@ -9,7 +9,6 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 
 #define RENDERER_MEMORY_ARENA_SIZE (3 * 1024 * 1024)
 
-#define MAX_COMMAND_LIST_COUNT 16
 #define MAX_RTV_COUNT 1024
 #define MAX_DSV_COUNT 1024
 #define BINDLESS_HEAP_CAPACITY 1000000
@@ -132,8 +131,16 @@ struct ConstantBuffer {
     Descriptor view;
 };
 
-struct CommandList {
+struct CommandQueue {
+    ID3D12CommandQueue* queue;
     u64 fence_val;
+    ID3D12Fence* fence;
+};
+
+struct CommandList {
+    CommandList* next;
+    u64 fence_val;
+    CommandQueue* queue;
     ID3D12CommandAllocator* allocator;
     ID3D12GraphicsCommandList* list;
     ConstantBuffer* constant_buffer_list;
@@ -152,6 +159,43 @@ struct MeshData {
     u32 index_count;
 };
 
+internal CommandQueue command_queue_init(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) {
+    CommandQueue queue = {};
+
+    D3D12_COMMAND_QUEUE_DESC desc = {};
+    desc.Type = type;
+
+    device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue.queue));
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue.fence));
+
+    return queue;
+}
+
+internal void command_queue_release(CommandQueue* queue) {
+    queue->fence->Release();
+    queue->queue->Release();
+}
+
+internal u64 command_queue_signal(CommandQueue* queue) {
+    u64 val = ++queue->fence_val;
+    queue->queue->Signal(queue->fence, val);
+    return val;
+};
+
+internal bool command_queue_reached(CommandQueue* queue, u64 val) {
+    return queue->fence->GetCompletedValue() >= val;
+}
+
+internal void command_queue_wait(CommandQueue* queue, u64 val) {
+    if (queue->fence->GetCompletedValue() < val) {
+        queue->fence->SetEventOnCompletion(val, 0);
+    }
+}
+
+internal void command_queue_flush(CommandQueue* queue) {
+    command_queue_wait(queue, command_queue_signal(queue));
+}
+
 struct Renderer {
     Arena arena;
 
@@ -159,9 +203,7 @@ struct Renderer {
     IDXGIAdapter* adapter;
     ID3D12Device* device;
 
-    ID3D12CommandQueue* queue;
-    ID3D12Fence* fence;
-    u64 fence_counter;
+    CommandQueue direct_queue;
 
     DescriptorHeap rtv_heap;
     DescriptorHeap dsv_heap;
@@ -176,10 +218,8 @@ struct Renderer {
 
     ConstantBuffer* available_constant_buffer_list;
 
-    int num_available_command_lists;
-    int num_executing_command_lists;
-    CommandList available_command_lists[MAX_COMMAND_LIST_COUNT];
-    CommandList executing_command_lists[MAX_COMMAND_LIST_COUNT];
+    CommandList* available_command_lists;
+    CommandList* executing_command_lists;
 
     ReleasableResource* releasable_resource_list;
 
@@ -195,31 +235,14 @@ struct Renderer {
     #endif
 };
 
-internal u64 fence_signal(Renderer* r) {
-    u64 val = ++r->fence_counter;
-    r->queue->Signal(r->fence, val);
-    return val;
-}
-
-internal void fence_wait(Renderer* r, u64 val) {
-    if (r->fence->GetCompletedValue() < val) {
-        r->fence->SetEventOnCompletion(val, 0);
-    }
-}
-
-internal b32 fence_reached(Renderer* r, u64 val) {
-    return r->fence->GetCompletedValue() >= val;
-}
-
-internal void wait_device_idle(Renderer* r) {
-    fence_wait(r, fence_signal(r));
-}
-
 internal void update_available_command_lists(Renderer* r) { 
-    for (int i = r->num_executing_command_lists - 1; i >= 0; --i)
+    for (CommandList** p_cmd = &r->executing_command_lists; *p_cmd;)
     {
-        CommandList* cmd = &r->executing_command_lists[i];
-        if (fence_reached(r, cmd->fence_val)) {
+        CommandList* cmd = *p_cmd;
+        if (command_queue_reached(cmd->queue, cmd->fence_val))
+        {
+            // Add all constant buffers back into available pool
+
             if (cmd->constant_buffer_list) {
                 ConstantBuffer* n = cmd->constant_buffer_list;
                 while (n->next) {
@@ -230,48 +253,56 @@ internal void update_available_command_lists(Renderer* r) {
                 cmd->constant_buffer_list = NULL;
             }
 
-            assert(r->num_available_command_lists < MAX_COMMAND_LIST_COUNT);
-            r->available_command_lists[r->num_available_command_lists++] = *cmd;
-            r->executing_command_lists[i] = r->executing_command_lists[--r->num_executing_command_lists];
+            // Add command list into available list
+
+            CommandList* next = cmd->next;
+            cmd->next = r->available_command_lists;
+            r->available_command_lists = cmd;
+            *p_cmd = next;
+        }
+        else {
+            p_cmd = &cmd->next;
         }
     }
 }
 
-internal CommandList open_command_list(Renderer* r) {
+internal CommandList* open_command_list(Renderer* r) {
     update_available_command_lists(r);
 
-    if (r->num_available_command_lists == 0) {
-        CommandList cmd = {};
+    if (!r->available_command_lists) {
+        CommandList* cmd = arena_push_struct_zero(&r->arena, CommandList);
 
-        r->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd.allocator));
-        r->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd.allocator, 0, IID_PPV_ARGS(&cmd.list));
-        cmd.list->Close();
+        r->device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmd->allocator));
+        r->device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmd->allocator, 0, IID_PPV_ARGS(&cmd->list));
+        cmd->list->Close();
 
         debug_message("Allocated a command list.\n");
 
-        r->available_command_lists[r->num_available_command_lists++] = cmd;
+        r->available_command_lists = cmd;
     }
 
-    CommandList cmd = r->available_command_lists[--r->num_available_command_lists];
+    CommandList* cmd = r->available_command_lists;
+    r->available_command_lists = cmd->next;
 
-    cmd.allocator->Reset();
-    cmd.list->Reset(cmd.allocator, 0);
+    cmd->allocator->Reset();
+    cmd->list->Reset(cmd->allocator, 0);
 
-    cmd.list->SetGraphicsRootSignature(r->root_signature);
-    cmd.list->SetDescriptorHeaps(1, &r->bindless_heap.heap);
+    cmd->list->SetGraphicsRootSignature(r->root_signature);
+    cmd->list->SetDescriptorHeaps(1, &r->bindless_heap.heap);
 
     return cmd;
 }
 
-internal void submit_command_list(Renderer* r, CommandList cmd) {
-    cmd.list->Close();
+internal void submit_command_list(Renderer* r, CommandQueue* queue, CommandList* cmd) {
+    cmd->list->Close();
 
-    ID3D12CommandList* decayed = cmd.list;
-    r->queue->ExecuteCommandLists(1, &decayed);
-    cmd.fence_val = fence_signal(r);
+    ID3D12CommandList* decayed = cmd->list;
+    queue->queue->ExecuteCommandLists(1, &decayed);
+    cmd->fence_val = command_queue_signal(queue);
+    cmd->queue = queue;
     
-    assert(r->num_executing_command_lists < MAX_COMMAND_LIST_COUNT);
-    r->executing_command_lists[r->num_executing_command_lists++] = cmd;
+    cmd->next = r->executing_command_lists;
+    r->executing_command_lists = cmd;
 }
 
 internal void get_swapchain_buffers_and_create_rtvs(Renderer* r) {
@@ -452,8 +483,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 
-    r->device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&r->queue));
-    r->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&r->fence));
+    r->direct_queue = command_queue_init(r->device, D3D12_COMMAND_LIST_TYPE_DIRECT);
 
     r->rtv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, MAX_RTV_COUNT, false, 1);
     r->dsv_heap = descriptor_heap_init(arena, r->device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, MAX_DSV_COUNT, false, 2);
@@ -486,7 +516,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     IDXGISwapChain1* swapchain_1;
-    if (FAILED(r->factory->CreateSwapChainForHwnd(r->queue, (HWND)window, &swapchain_desc, 0, 0, &swapchain_1))) {
+    if (FAILED(r->factory->CreateSwapChainForHwnd(r->direct_queue.queue, (HWND)window, &swapchain_desc, 0, 0, &swapchain_1))) {
         system_message_box("Failed to create D3D12 swapchain.");
     }
     swapchain_1->QueryInterface(&r->swapchain);
@@ -561,14 +591,14 @@ Renderer* renderer_init(Arena* arena, void* window) {
 void renderer_release_backend(Renderer* r) {
     UNUSED(r);
 #if _DEBUG
-    wait_device_idle(r);
+    command_queue_flush(&r->direct_queue);
 
     update_available_command_lists(r);
-    assert(r->num_executing_command_lists == 0);
+    assert(!r->executing_command_lists);
 
-    for (int i = 0; i < r->num_available_command_lists; ++i) {
-        r->available_command_lists[i].allocator->Release();
-        r->available_command_lists[i].list->Release();
+    for (CommandList* cmd = r->available_command_lists; cmd; cmd = cmd->next) {
+        cmd->allocator->Release();
+        cmd->list->Release();
     }
 
     for (int i = 0; i < MESH_MEMORY_COUNT; ++i) {
@@ -598,8 +628,7 @@ void renderer_release_backend(Renderer* r) {
     r->dsv_heap.heap->Release();
     r->rtv_heap.heap->Release();
 
-    r->fence->Release();
-    r->queue->Release();
+    command_queue_release(&r->direct_queue);
 
     r->device->Release();
     r->adapter->Release();
@@ -612,7 +641,7 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
         return;
     }
 
-    wait_device_idle(r);
+    command_queue_flush(&r->direct_queue);
 
     release_swapchain_buffers(r);
     r->swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
@@ -692,14 +721,14 @@ internal MeshData* get_mesh_data(Renderer* r, Mesh handle) {
     return &r->mesh_data[handle.index];
 }
 
-void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len) {
+void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len) {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     r->swapchain->GetDesc1(&swapchain_desc);
 
     u32 swapchain_index = r->swapchain->GetCurrentBackBufferIndex();
-    fence_wait(r, r->swapchain_fences[swapchain_index]);
+    command_queue_wait(&r->direct_queue, r->swapchain_fences[swapchain_index]);
 
-    CommandList cmd = open_command_list(r);
+    CommandList* cmd = open_command_list(r);
 
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -708,15 +737,15 @@ void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len) {
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-    cmd.list->ResourceBarrier(1, &barrier);
+    cmd->list->ResourceBarrier(1, &barrier);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = cpu_descriptor_handle(&r->rtv_heap, r->swapchain_rtvs[swapchain_index]);
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = cpu_descriptor_handle(&r->dsv_heap, r->depth_view);
 
     f32 clear_color[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
-    cmd.list->ClearRenderTargetView(rtv_handle, clear_color, 0, 0);
-    cmd.list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, 0);
-    cmd.list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle);
+    cmd->list->ClearRenderTargetView(rtv_handle, clear_color, 0, 0);
+    cmd->list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, 0);
+    cmd->list->OMSetRenderTargets(1, &rtv_handle, false, &dsv_handle);
 
     D3D12_RECT scissor = {};
     scissor.right = swapchain_desc.Width;
@@ -727,41 +756,42 @@ void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len) {
     viewport.Width = (f32)swapchain_desc.Width;
     viewport.Height = (f32)swapchain_desc.Height;
 
-    cmd.list->RSSetScissorRects(1, &scissor);
-    cmd.list->RSSetViewports(1, &viewport);
+    cmd->list->RSSetScissorRects(1, &scissor);
+    cmd->list->RSSetViewports(1, &viewport);
 
-    cmd.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cmd.list->SetPipelineState(r->pipeline);
+    cmd->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->list->SetPipelineState(r->pipeline);
 
-    XMMATRIX view_matrix = XMMatrixLookAtRH({ 0.0f, 0.0f, 3.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f });
-    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(PI32 * 0.25f, (f32)swapchain_desc.Width / (f32)swapchain_desc.Height, 1000.0f, 0.1f);
+    f32 aspect_ratio = (f32)swapchain_desc.Width / (f32)swapchain_desc.Height;
+    XMMATRIX view_matrix = XMMatrixInverse(0, camera->transform);
+    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(camera->fov/aspect_ratio, aspect_ratio, 1000.0f, 0.1f);
     XMMATRIX view_projection = view_matrix * projection_matrix;
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
-    drop_constant_buffer(&cmd, camera_cbuffer);
-    cmd.list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
+    drop_constant_buffer(cmd, camera_cbuffer);
+    cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
 
     for (u32 i = 0; i < queue_len; ++i) {
         MeshInstance* mesh_sub = &queue[i];
         MeshData* mesh_data = get_mesh_data(r, mesh_sub->mesh);
 
         ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &mesh_sub->transform, sizeof(mesh_sub->transform));
-        drop_constant_buffer(&cmd, transform_cbuffer);
+        drop_constant_buffer(cmd, transform_cbuffer);
 
-        cmd.list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
-        cmd.list->SetGraphicsRoot32BitConstant(0, mesh_data->ibuffer_view.index, 2);
-        cmd.list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->view.index, 3);
+        cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
+        cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->ibuffer_view.index, 2);
+        cmd->list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->view.index, 3);
 
-        cmd.list->DrawInstanced(mesh_data->index_count, 1, 0, 0);
+        cmd->list->DrawInstanced(mesh_data->index_count, 1, 0, 0);
     }
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cmd.list->ResourceBarrier(1, &barrier);
+    cmd->list->ResourceBarrier(1, &barrier);
 
-    submit_command_list(r, cmd);
+    submit_command_list(r, &r->direct_queue, cmd);
 
     r->swapchain->Present(1, 0);
-    r->swapchain_fences[swapchain_index] = fence_signal(r);
+    r->swapchain_fences[swapchain_index] = command_queue_signal(&r->direct_queue);
 }
 
 Mesh renderer_new_mesh(Renderer* r, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {

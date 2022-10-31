@@ -737,7 +737,11 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             gltf.instances[i].transform *= XMMatrixRotationRollPitchYaw(0.0f, dt * PI32, 0.0f);
         }
 
-        renderer_render_frame(renderer, gltf.instances, gltf.num_instances);
+        Camera camera;
+        camera.transform = XMMatrixTranslation(0.0f, 0.0f, 5.0f);
+        camera.fov = PI32 * 0.5f;
+
+        renderer_render_frame(renderer, &camera, gltf.instances, gltf.num_instances);
     }
 
     renderer_release_backend(renderer);

@@ -24,7 +24,12 @@ struct MeshInstance {
     XMMATRIX transform;
 };
 
-void renderer_render_frame(Renderer* r, MeshInstance* queue, u32 queue_len);
+struct Camera {
+    XMMATRIX transform;
+    f32 fov;
+};
+
+void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len);
 
 struct Vertex {
     XMFLOAT3 pos;
