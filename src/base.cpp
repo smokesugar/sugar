@@ -22,6 +22,8 @@ void* arena_push(Arena* arena, u64 size) {
         return NULL;
     }
 
+    size = (size + 7) & ~7;
+
     assert((i64)size <= (arena->end - arena->cursor));
     void* ptr = arena->cursor;
     arena->cursor += size;
