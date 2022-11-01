@@ -3,6 +3,8 @@
 #include "renderer.h"
 
 struct LoadGLTFResult {
+    u32 num_materials;
+    Material* materials;
     u32 num_instances;
     MeshInstance* instances;
 };

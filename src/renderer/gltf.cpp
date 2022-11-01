@@ -242,62 +242,76 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
         }
     }
 
-    Json* asset_images = json_query(root, "images");
-    GLTFImage* images = arena_push_array_zero(scratch.arena, GLTFImage, json_len(asset_images));
+    GLTFImage* images = 0;
     int num_images = 0;
 
-    JSON_FOREACH(asset_images, asset_image) {
-        Scratch image_scratch = get_scratch(&arena, 1);
+    Json* asset_images = json_query(root, "images");
+    if (asset_images) {
+        images = arena_push_array_zero(scratch.arena, GLTFImage, json_len(asset_images));
 
-        GLTFImage* image = &images[num_images++];
+        JSON_FOREACH(asset_images, asset_image) {
+            Scratch image_scratch = get_scratch(&arena, 1);
 
-        void* compressed_memory = 0;
-        u64 compressed_memory_size = 0;
+            GLTFImage* image = &images[num_images++];
 
-        if (Json* uri = json_query(asset_image, "uri")) {
-            ReadFileResult file = read_file(image_scratch.arena, uri->string);
-            compressed_memory = file.memory;
-            compressed_memory_size = file.size;
+            void* compressed_memory = 0;
+            u64 compressed_memory_size = 0;
+
+            if (Json* uri = json_query(asset_image, "uri")) {
+                ReadFileResult file = read_file(image_scratch.arena, uri->string);
+                compressed_memory = file.memory;
+                compressed_memory_size = file.size;
+            }
+            else if(Json* bufferView = json_query(asset_image, "bufferView")) {
+                assert(bufferView->integer < num_views);
+                GLTFBufferView* view = &views[bufferView->integer];
+                compressed_memory = (u8*)view->buffer->memory + view->offset;
+                compressed_memory_size = view->len;
+            }
+            else {
+                assert(false);
+            }
+
+            int width, height;
+            image->memory = stbi_load_from_memory((stbi_uc*)compressed_memory, (int)compressed_memory_size, &width, &height, 0, 4);
+
+            image->width = width;
+            image->height = width;
+
+            release_scratch(image_scratch);
         }
-        else if(Json* bufferView = json_query(asset_image, "bufferView")) {
-            assert(bufferView->integer < num_views);
-            GLTFBufferView* view = &views[bufferView->integer];
-            compressed_memory = (u8*)view->buffer->memory + view->offset;
-            compressed_memory_size = view->len;
-        }
-        else {
-            assert(false);
-        }
-
-        int width, height;
-        image->memory = stbi_load_from_memory((stbi_uc*)compressed_memory, (int)compressed_memory_size, &width, &height, 0, 4);
-
-        image->width = width;
-        image->height = width;
-
-        release_scratch(image_scratch);
     }
 
-    Json* asset_textures = json_query(root, "textures");
-    GLTFTexture* textures = arena_push_array(scratch.arena, GLTFTexture, json_len(asset_textures));
+    GLTFTexture* textures = 0;
     int num_textures = 0;
 
-    JSON_FOREACH(asset_textures, asset_texture) {
-        i64 index = json_query(asset_texture, "source")->integer;
-        assert(index < num_images);
-        textures[num_textures++].image = &images[index];
+    Json* asset_textures = json_query(root, "textures");
+    if (asset_textures) {
+        textures = arena_push_array(scratch.arena, GLTFTexture, json_len(asset_textures));
+
+        JSON_FOREACH(asset_textures, asset_texture) {
+            i64 index = json_query(asset_texture, "source")->integer;
+            assert(index < num_images);
+            textures[num_textures++].image = &images[index];
+        }
     }
 
-    Json* asset_materials = json_query(root, "materials");
-    Material* materials = arena_push_array_zero(scratch.arena, Material, json_len(asset_materials));
+    // Materials will be stored in the output arena because they are returned
+
+    Material* materials = 0;
     int num_materials = 0;
 
-    JSON_FOREACH(asset_materials, asset_material) {
-        u64 base_color_texture = json_query(json_query(json_query(asset_material, "pbrMetallicRoughness"), "baseColorTexture"), "index")->integer;
-        assert(base_color_texture < num_textures);
-        GLTFTexture* texture = &textures[base_color_texture];
-        GLTFImage* image = texture->image;
-        materials[num_materials++] = renderer_new_material(renderer, upload_context, image->width, image->height, image->memory);
+    Json* asset_materials = json_query(root, "materials");
+    if (asset_materials) {
+        materials = arena_push_array_zero(arena, Material, json_len(asset_materials));
+
+        JSON_FOREACH(asset_materials, asset_material) {
+            u64 base_color_texture = json_query(json_query(json_query(asset_material, "pbrMetallicRoughness"), "baseColorTexture"), "index")->integer;
+            assert(base_color_texture < num_textures);
+            GLTFTexture* texture = &textures[base_color_texture];
+            GLTFImage* image = texture->image;
+            materials[num_materials++] = renderer_new_material(renderer, upload_context, image->width, image->height, image->memory);
+        }
     }
 
     Json* asset_meshes = json_query(root, "meshes");
@@ -372,11 +386,16 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
                     assert(false && "Unreachable");
             }
 
-            u32 material_index = (u32)json_query(primitive, "material")->integer;
-
             GLTFPrimitive* prim = &mesh->primitives[primitive_index++];
             prim->mesh = renderer_new_mesh(renderer, upload_context, vertex_data, vertex_count, index_data, index_count);
-            prim->material = materials[material_index];
+
+            if (Json* material = json_query(primitive, "material")) {
+                assert(material->integer < num_materials);
+                prim->material = materials[material->integer];
+            }
+            else {
+                prim->material = renderer_get_default_material(renderer);
+            }
 
             release_scratch(prim_scratch);
         }
@@ -458,6 +477,8 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
     }
 
     LoadGLTFResult result;
+    result.num_materials = num_materials;
+    result.materials = materials;
     result.num_instances = 0;
     result.instances = arena_mark(arena, MeshInstance);
 

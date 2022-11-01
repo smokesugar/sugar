@@ -201,7 +201,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         f32 time = engine_time();
         f32 dt = time - last_time;
         last_time = time;
-        
+
         events = {};
         MSG msg;
         while (PeekMessageA(&msg, window, 0, 0, PM_REMOVE)) {
@@ -244,10 +244,10 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         if (renderer_mesh_alive(renderer, gltf.instances[i].mesh)) {
             renderer_free_mesh(renderer, gltf.instances[i].mesh);
         }
+    }
 
-        if (renderer_material_alive(renderer, gltf.instances[i].material)) {
-            renderer_free_material(renderer, gltf.instances[i].material);
-        }
+    for (u32 i = 0; i < gltf.num_materials; ++i) {
+        renderer_free_material(renderer, gltf.materials[i]);
     }
     #endif
 
