@@ -2,6 +2,9 @@
 #include <agility/d3d12.h>
 #include <dxc/dxcapi.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #include "renderer.h"
 
 extern "C" __declspec(dllexport) extern const UINT D3D12SDKVersion = 606;
@@ -688,10 +691,13 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
 
+    int texture_w, texture_h;
+    void* texture_data = stbi_load("shebrokeimup.png", &texture_w, &texture_h, 0, 4);
+
     D3D12_RESOURCE_DESC texture_desc = {};
     texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture_desc.Width = 4;
-    texture_desc.Height = 4;
+    texture_desc.Width = texture_w;
+    texture_desc.Height = texture_h;
     texture_desc.DepthOrArraySize = 1;
     texture_desc.MipLevels = 1;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -702,12 +708,8 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&r->texture));
 
-    u32 texture_data[16];
-    for (u32 i = 0; i < ARRAY_LEN(texture_data); ++i) {
-        texture_data[i] = 255;
-    }
-
-    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, sizeof(texture_data));
+    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, texture_w * texture_h * sizeof(u32));
+    stbi_image_free(texture_data);
     
     D3D12_TEXTURE_COPY_LOCATION dest_loc = {};
     dest_loc.pResource = r->texture;
@@ -720,7 +722,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     src_loc.PlacedFootprint.Footprint.Width = (u32)texture_desc.Width;
     src_loc.PlacedFootprint.Footprint.Height = texture_desc.Height;
     src_loc.PlacedFootprint.Footprint.Depth = 1;
-    src_loc.PlacedFootprint.Footprint.RowPitch = 4 * sizeof(u32);
+    src_loc.PlacedFootprint.Footprint.RowPitch = (u32)texture_desc.Width * sizeof(u32);
         
     upload_context->cmd->list->CopyTextureRegion(&dest_loc, 0, 0, 0, &src_loc, 0);
     append_releasable_resource(r, staging_texture, &upload_context->releasable_resources);

@@ -26,6 +26,7 @@ project "sugar"
         "src",
         "extern/agility/include",
         "extern/DirectXShaderCompiler/include",
+        "extern/stb"
     }
 
     links {
