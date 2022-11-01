@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 #include "gltf.h"
-#include "json.h"
+#include "utility/json.h"
 
 struct GLTFBuffer {
     u64 len;

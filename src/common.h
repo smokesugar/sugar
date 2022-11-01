@@ -2,5 +2,5 @@
 
 #include <assert.h>
 
-#include "base.h"
-#include "platform.h"
+#include "core/base.h"
+#include "core/platform.h"

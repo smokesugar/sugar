@@ -3,8 +3,8 @@
 #include <stdio.h>
 
 #include "common.h"
-#include "renderer.h"
-#include "gltf.h"
+#include "renderer/renderer.h"
+#include "renderer/gltf.h"
 
 void system_message_box(char* fmt, ...) {
     va_list args;
