@@ -224,7 +224,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         }
 
         Camera camera;
-        camera.transform = XMMatrixTranslation(0.0f, 0.0f, 5.0f);
+        camera.transform = XMMatrixTranslation(0.0f, 0.0f, 3.0f);
         camera.fov = PI32 * 0.5f;
 
         MeshInstance* queue = 0;
@@ -243,6 +243,10 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     for (u32 i = 0; i < gltf.num_instances; ++i) {
         if (renderer_mesh_alive(renderer, gltf.instances[i].mesh)) {
             renderer_free_mesh(renderer, gltf.instances[i].mesh);
+        }
+
+        if (renderer_material_alive(renderer, gltf.instances[i].material)) {
+            renderer_free_material(renderer, gltf.instances[i].material);
         }
     }
     #endif

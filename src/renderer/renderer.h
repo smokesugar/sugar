@@ -11,6 +11,10 @@ struct Mesh {
     u64 handle;
 };
 
+struct Material {
+    u64 handle;
+};
+
 Renderer* renderer_init(Arena* arena, void* window);
 void renderer_release_backend(Renderer* r);
 
@@ -18,6 +22,7 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height);
 
 struct MeshInstance {
     Mesh mesh;
+    Material material;
     XMMATRIX transform;
 };
 
@@ -27,6 +32,8 @@ struct Camera {
 };
 
 void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len);
+
+Material renderer_get_default_material(Renderer* r);
 
 struct RendererUploadContext;
 struct RendererUploadTicket;
@@ -45,3 +52,7 @@ struct Vertex {
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count);
 void renderer_free_mesh(Renderer* r, Mesh mesh);
 bool renderer_mesh_alive(Renderer* r, Mesh mesh);
+
+Material renderer_new_material(Renderer* r, RendererUploadContext* upload_context, u32 texture_w, u32 texture_h, void* texture_data);
+void renderer_free_material(Renderer* r, Material mat);
+bool renderer_material_alive(Renderer* r, Material mat);

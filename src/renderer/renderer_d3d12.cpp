@@ -19,7 +19,8 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define CONSTANT_BUFFER_SIZE 256
 #define CONSTANT_BUFFER_POOL_SIZE 256
 
-#define MESH_MEMORY_COUNT (8 * 1024)
+#define MAX_MESHES (8 * 1024)
+#define MAX_MATERIALS (8 * 1024)
 
 struct Descriptor {
     #if _DEBUG
@@ -163,6 +164,11 @@ struct MeshData {
     u32 index_count;
 };
 
+struct MaterialData {
+    ID3D12Resource* texture;
+    Descriptor texture_view;
+};
+
 struct RendererUploadContext {
     CommandList* cmd;
     ReleasableResource* releasable_resources;
@@ -247,9 +253,9 @@ struct Renderer {
     Descriptor depth_view;
 
     ResourcePool* mesh_pool;
+    ResourcePool* material_pool;
 
-    ID3D12Resource* texture;
-    Descriptor texture_view;
+    Material default_material;
 };
 
 internal void update_available_command_lists(Renderer* r) { 
@@ -677,55 +683,13 @@ Renderer* renderer_init(Arena* arena, void* window) {
     r->depth_view = alloc_descriptor(&r->dsv_heap);
     create_depth_buffer(r, swapchain_desc.Width, swapchain_desc.Height);
 
-    r->mesh_pool = resource_pool_new(arena, MESH_MEMORY_COUNT, sizeof(MeshData));
+    r->mesh_pool = resource_pool_new(arena, MAX_MESHES, sizeof(MeshData));
+    r->material_pool = resource_pool_new(arena, MAX_MATERIALS, sizeof(MaterialData));
 
     RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
 
-    int texture_w, texture_h;
-    void* texture_data = stbi_load("shebrokeimup.png", &texture_w, &texture_h, 0, 4);
-
-    D3D12_RESOURCE_DESC texture_desc = {};
-    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    texture_desc.Width = texture_w;
-    texture_desc.Height = texture_h;
-    texture_desc.DepthOrArraySize = 1;
-    texture_desc.MipLevels = 1;
-    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    texture_desc.SampleDesc.Count = 1;
-
-    D3D12_HEAP_PROPERTIES heap_props = {};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&r->texture));
-
-    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, texture_w * texture_h * sizeof(u32));
-    stbi_image_free(texture_data);
-    
-    D3D12_TEXTURE_COPY_LOCATION dest_loc = {};
-    dest_loc.pResource = r->texture;
-    dest_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-
-    D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-    src_loc.pResource = staging_texture;
-    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src_loc.PlacedFootprint.Footprint.Format = texture_desc.Format;
-    src_loc.PlacedFootprint.Footprint.Width = (u32)texture_desc.Width;
-    src_loc.PlacedFootprint.Footprint.Height = texture_desc.Height;
-    src_loc.PlacedFootprint.Footprint.Depth = 1;
-    src_loc.PlacedFootprint.Footprint.RowPitch = (u32)texture_desc.Width * sizeof(u32);
-        
-    upload_context->cmd->list->CopyTextureRegion(&dest_loc, 0, 0, 0, &src_loc, 0);
-    append_releasable_resource(r, staging_texture, &upload_context->releasable_resources);
-
-    r->texture_view = alloc_descriptor(&r->bindless_heap);
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-    srv_desc.Format = texture_desc.Format;
-    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv_desc.Texture2D.MipLevels = (u32)-1;
-
-    r->device->CreateShaderResourceView(r->texture, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, r->texture_view));
+    u32 default_texture_data = UINT32_MAX;
+    r->default_material = renderer_new_material(r, upload_context, 1, 1, &default_texture_data);
 
     renderer_flush_upload(r, renderer_submit_upload_context(scratch.arena, r, upload_context));
 
@@ -734,11 +698,15 @@ Renderer* renderer_init(Arena* arena, void* window) {
     return r;
 }
 
+internal void wait_device_idle(Renderer* r) {
+    command_queue_flush(&r->direct_queue);
+    command_queue_flush(&r->copy_queue);
+}
+
 void renderer_release_backend(Renderer* r) {
     UNUSED(r);
 #if _DEBUG
-    command_queue_flush(&r->direct_queue);
-    command_queue_flush(&r->copy_queue);
+    wait_device_idle(r);
 
     update_available_command_lists(r);
     assert(!r->executing_command_lists);
@@ -748,9 +716,10 @@ void renderer_release_backend(Renderer* r) {
         cmd->list->Release();
     }
 
-    r->texture->Release();
+    renderer_free_material(r, r->default_material);
 
     assert(resource_pool_num_allocations(r->mesh_pool) == 0 && "Outstanding meshes. Free all meshes in debug builds.");
+    assert(resource_pool_num_allocations(r->material_pool) == 0 && "Outstanding materials. Free all materials in debug builds.");
 
     r->depth_buffer->Release();
     r->pipeline->Release();
@@ -909,11 +878,11 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     drop_constant_buffer(cmd, camera_cbuffer);
     cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
 
-    cmd->list->SetGraphicsRoot32BitConstant(0, r->texture_view.index, 4);
-
     for (u32 i = 0; i < queue_len; ++i) {
         MeshInstance* instance = &queue[i];
+
         MeshData* mesh_data = resource_pool_access(r->mesh_pool, instance->mesh.handle, MeshData);
+        MaterialData* mat_data = resource_pool_access(r->material_pool, instance->material.handle, MaterialData);
 
         ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &instance->transform, sizeof(instance->transform));
         drop_constant_buffer(cmd, transform_cbuffer);
@@ -921,6 +890,8 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
         cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
         cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->ibuffer_view.index, 2);
         cmd->list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->view.index, 3);
+        cmd->list->SetGraphicsRoot32BitConstant(0, mat_data->texture_view.index, 4);
+
 
         cmd->list->DrawInstanced(mesh_data->index_count, 1, 0, 0);
     }
@@ -933,6 +904,10 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
 
     r->swapchain->Present(1, 0);
     r->swapchain_fences[swapchain_index] = command_queue_signal(&r->direct_queue);
+}
+
+Material renderer_get_default_material(Renderer* r) {
+    return r->default_material;
 }
 
 RendererUploadContext* renderer_open_upload_context(Arena* arena, Renderer* r) {
@@ -975,8 +950,6 @@ void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket) {
 }
 
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
-    UNUSED(upload_context);
-
     u64 handle = resource_pool_alloc(r->mesh_pool);
 
     u32 vertex_data_size = vertex_count * sizeof(Vertex);
@@ -1034,8 +1007,7 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
 }
 
 void renderer_free_mesh(Renderer* r, Mesh mesh) {
-    command_queue_flush(&r->direct_queue);
-    command_queue_flush(&r->copy_queue);
+    wait_device_idle(r);
 
     MeshData* data = resource_pool_access(r->mesh_pool, mesh.handle, MeshData);
 
@@ -1049,4 +1021,71 @@ void renderer_free_mesh(Renderer* r, Mesh mesh) {
 
 bool renderer_mesh_alive(Renderer* r, Mesh mesh) {
     return resource_pool_handle_valid(r->mesh_pool, mesh.handle);
+}
+
+Material renderer_new_material(Renderer* r, RendererUploadContext* upload_context, u32 texture_w, u32 texture_h, void* texture_data) {
+    u64 handle = resource_pool_alloc(r->material_pool);
+
+    MaterialData* data = resource_pool_access(r->material_pool, handle, MaterialData);
+
+    D3D12_RESOURCE_DESC texture_desc = {};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = texture_w;
+    texture_desc.Height = texture_h;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&data->texture));
+
+    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, texture_w * texture_h * sizeof(u32));
+    
+    D3D12_TEXTURE_COPY_LOCATION dest_loc = {};
+    dest_loc.pResource = data->texture;
+    dest_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+    src_loc.pResource = staging_texture;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src_loc.PlacedFootprint.Footprint.Format = texture_desc.Format;
+    src_loc.PlacedFootprint.Footprint.Width = texture_w;
+    src_loc.PlacedFootprint.Footprint.Height = texture_h;
+    src_loc.PlacedFootprint.Footprint.Depth = 1;
+    src_loc.PlacedFootprint.Footprint.RowPitch = texture_w * sizeof(u32);
+        
+    upload_context->cmd->list->CopyTextureRegion(&dest_loc, 0, 0, 0, &src_loc, 0);
+    append_releasable_resource(r, staging_texture, &upload_context->releasable_resources);
+
+    data->texture_view = alloc_descriptor(&r->bindless_heap);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = texture_desc.Format;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = (u32)-1;
+
+    r->device->CreateShaderResourceView(data->texture, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, data->texture_view));
+
+    Material mat;
+    mat.handle = handle;
+
+    return mat;
+}
+
+void renderer_free_material(Renderer* r, Material mat) {
+    wait_device_idle(r);
+
+    MaterialData* data = resource_pool_access(r->material_pool, mat.handle, MaterialData);
+    data->texture->Release();
+    free_descriptor(&r->bindless_heap, data->texture_view);
+    
+    resource_pool_free(r->material_pool, mat.handle);
+}
+
+bool renderer_material_alive(Renderer* r, Material mat) {
+    return resource_pool_handle_valid(r->material_pool, mat.handle);
 }
