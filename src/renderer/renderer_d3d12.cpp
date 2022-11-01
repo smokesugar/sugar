@@ -2,10 +2,10 @@
 #include <agility/d3d12.h>
 #include <dxc/dxcapi.h>
 
-#define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
 #include "renderer.h"
+#include "utility/resource_pool.h"
 
 extern "C" __declspec(dllexport) extern const UINT D3D12SDKVersion = 606;
 extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
@@ -32,7 +32,7 @@ struct DescriptorHeap {
     #if _DEBUG
         u16 id;
         u32 size;
-        u16* versions;
+        u16* generations;
     #endif
     int free_count;
     u32* free_list;
@@ -51,9 +51,9 @@ internal DescriptorHeap descriptor_heap_init(Arena* arena, ID3D12Device* device,
         heap.id = id;
         heap.size = size;
 
-        heap.versions = arena_push_array(arena, u16, size);
+        heap.generations = arena_push_array(arena, u16, size);
         for (u32 i = 0; i < size; ++i) {
-            heap.versions[i] = 1;
+            heap.generations[i] = 1;
         }
     #endif
     
@@ -89,7 +89,7 @@ internal Descriptor alloc_descriptor(DescriptorHeap* heap) {
     descriptor.index = index;
     
     #if _DEBUG
-        descriptor.meta = (heap->id << 16) | heap->versions[index];
+        descriptor.meta = (heap->id << 16) | heap->generations[index];
     #endif
 
     return descriptor;
@@ -102,7 +102,7 @@ internal Descriptor alloc_descriptor(DescriptorHeap* heap) {
 
         assert(descriptor.index < heap->size);
         assert((descriptor.meta >> 16) == heap->id);
-        assert((descriptor.meta & UINT16_MAX) == heap->versions[descriptor.index]);
+        assert((descriptor.meta & UINT16_MAX) == heap->generations[descriptor.index]);
     }
 #else
     #define validate_descriptor(heap, descriptor) 0
@@ -112,7 +112,7 @@ internal void free_descriptor(DescriptorHeap* heap, Descriptor descriptor) {
     validate_descriptor(heap, descriptor);
 
     #if _DEBUG
-        ++heap->versions[descriptor.index];
+        ++heap->generations[descriptor.index];
     #endif
 
     heap->free_list[heap->free_count++] = descriptor.index;
@@ -246,12 +246,7 @@ struct Renderer {
     ID3D12Resource* depth_buffer;
     Descriptor depth_view;
 
-    int num_free_meshes;
-    u32 mesh_free_list[MESH_MEMORY_COUNT];
-    MeshData mesh_data[MESH_MEMORY_COUNT];
-    #if _DEBUG
-        u16 mesh_versions[MESH_MEMORY_COUNT];
-    #endif
+    ResourcePool* mesh_pool;
 
     ID3D12Resource* texture;
     Descriptor texture_view;
@@ -682,12 +677,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     r->depth_view = alloc_descriptor(&r->dsv_heap);
     create_depth_buffer(r, swapchain_desc.Width, swapchain_desc.Height);
 
-    for (int i = 0; i < MESH_MEMORY_COUNT; ++i) {
-        r->mesh_free_list[r->num_free_meshes++] = i;
-        #if _DEBUG
-        r->mesh_versions[i] = 1;
-        #endif
-    }
+    r->mesh_pool = resource_pool_new(arena, MESH_MEMORY_COUNT, sizeof(MeshData));
 
     RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
 
@@ -760,12 +750,7 @@ void renderer_release_backend(Renderer* r) {
 
     r->texture->Release();
 
-    for (int i = 0; i < MESH_MEMORY_COUNT; ++i) {
-        if (r->mesh_data[i].vbuffer) {
-            r->mesh_data[i].vbuffer->Release();
-            r->mesh_data[i].ibuffer->Release();
-        }
-    }
+    assert(resource_pool_num_allocations(r->mesh_pool) == 0 && "Outstanding meshes. Free all meshes in debug builds.");
 
     r->depth_buffer->Release();
     r->pipeline->Release();
@@ -875,12 +860,6 @@ internal void drop_constant_buffer(CommandList* cmd, ConstantBuffer* cbuffer) {
     cmd->constant_buffer_list = cbuffer;
 }
 
-internal MeshData* get_mesh_data(Renderer* r, Mesh handle) {
-    assert(handle.index < MESH_MEMORY_COUNT);
-    assert(handle.version == r->mesh_versions[handle.index]);
-    return &r->mesh_data[handle.index];
-}
-
 void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len) {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     r->swapchain->GetDesc1(&swapchain_desc);
@@ -933,10 +912,10 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     cmd->list->SetGraphicsRoot32BitConstant(0, r->texture_view.index, 4);
 
     for (u32 i = 0; i < queue_len; ++i) {
-        MeshInstance* mesh_sub = &queue[i];
-        MeshData* mesh_data = get_mesh_data(r, mesh_sub->mesh);
+        MeshInstance* instance = &queue[i];
+        MeshData* mesh_data = resource_pool_access(r->mesh_pool, instance->mesh.handle, MeshData);
 
-        ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &mesh_sub->transform, sizeof(mesh_sub->transform));
+        ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &instance->transform, sizeof(instance->transform));
         drop_constant_buffer(cmd, transform_cbuffer);
 
         cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
@@ -998,14 +977,12 @@ void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket) {
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
     UNUSED(upload_context);
 
-    assert(r->num_free_meshes > 0);
-
-    u32 index = r->mesh_free_list[--r->num_free_meshes];
+    u64 handle = resource_pool_alloc(r->mesh_pool);
 
     u32 vertex_data_size = vertex_count * sizeof(Vertex);
     u32 index_data_size = index_count * sizeof(u32);
 
-    MeshData* data = &r->mesh_data[index];
+    MeshData* data = resource_pool_access(r->mesh_pool, handle, MeshData);
 
     D3D12_RESOURCE_DESC resource_desc = {};
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1050,11 +1027,26 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     append_releasable_resource(r, staging_vbuffer, &upload_context->releasable_resources);
     append_releasable_resource(r, staging_ibuffer, &upload_context->releasable_resources);
 
-    Mesh handle = {};
-    handle.index = index;
-    #if _DEBUG
-    handle.version = r->mesh_versions[index];
-    #endif
+    Mesh mesh = {};
+    mesh.handle = handle;
     
-    return handle;
+    return mesh;
+}
+
+void renderer_free_mesh(Renderer* r, Mesh mesh) {
+    command_queue_flush(&r->direct_queue);
+    command_queue_flush(&r->copy_queue);
+
+    MeshData* data = resource_pool_access(r->mesh_pool, mesh.handle, MeshData);
+
+    free_descriptor(&r->bindless_heap, data->ibuffer_view);
+    free_descriptor(&r->bindless_heap, data->vbuffer_view);
+    data->ibuffer->Release();
+    data->vbuffer->Release();
+
+    resource_pool_free(r->mesh_pool, mesh.handle);
+}
+
+bool renderer_mesh_alive(Renderer* r, Mesh mesh) {
+    return resource_pool_handle_valid(r->mesh_pool, mesh.handle);
 }

@@ -239,6 +239,14 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         renderer_render_frame(renderer, &camera, queue, queue_len);
     }
 
+    #if _DEBUG
+    for (u32 i = 0; i < gltf.num_instances; ++i) {
+        if (renderer_mesh_alive(renderer, gltf.instances[i].mesh)) {
+            renderer_free_mesh(renderer, gltf.instances[i].mesh);
+        }
+    }
+    #endif
+
     renderer_release_backend(renderer);
 
     return 0;

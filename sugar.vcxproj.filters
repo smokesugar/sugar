@@ -28,6 +28,7 @@
     <ClInclude Include="src\utility\json.h">
       <Filter>utility</Filter>
     </ClInclude>
+    <ClInclude Include="src\utility\resource_pool.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\core\base.cpp">
@@ -45,5 +46,7 @@
     <ClCompile Include="src\utility\json.cpp">
       <Filter>utility</Filter>
     </ClCompile>
+    <ClCompile Include="src\utility\extern_builds.cpp" />
+    <ClCompile Include="src\utility\resource_pool.cpp" />
   </ItemGroup>
 </Project>

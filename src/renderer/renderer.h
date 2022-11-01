@@ -8,10 +8,7 @@ using namespace DirectX;
 struct Renderer;
 
 struct Mesh { 
-    u32 index;
-    #if _DEBUG
-        u16 version;
-    #endif
+    u64 handle;
 };
 
 Renderer* renderer_init(Arena* arena, void* window);
@@ -46,3 +43,5 @@ struct Vertex {
 };
 
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count);
+void renderer_free_mesh(Renderer* r, Mesh mesh);
+bool renderer_mesh_alive(Renderer* r, Mesh mesh);
