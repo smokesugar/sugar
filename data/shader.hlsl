@@ -49,7 +49,7 @@ float4 ps_main(VSOut vso) : SV_Target{
 
     Texture2D<float3> test_texture = ResourceDescriptorHeap[di_texture];
 
-    float3 diffuse_color = test_texture.Sample(linear_sampler, vso.uv);;
+    float3 diffuse_color = pow(test_texture.Sample(linear_sampler, vso.uv), 2.0);
     float3 diffuse = max(dot(light_dir, normal), 0.0f) * diffuse_color;
 
     float3 ambient = 0.01f.xxx;
