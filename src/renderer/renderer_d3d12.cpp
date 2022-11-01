@@ -160,6 +160,16 @@ struct MeshData {
     u32 index_count;
 };
 
+struct RendererUploadContext {
+    CommandList* cmd;
+    ReleasableResource* releasable_resources;
+};
+
+struct RendererUploadTicket {
+    u64 fence_val;
+    ReleasableResource* releasable_resources;
+};
+
 internal CommandQueue command_queue_init(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) {
     CommandQueue queue = {};
 
@@ -239,6 +249,9 @@ struct Renderer {
     #if _DEBUG
         u16 mesh_versions[MESH_MEMORY_COUNT];
     #endif
+
+    ID3D12Resource* texture;
+    Descriptor texture_view;
 };
 
 internal void update_available_command_lists(Renderer* r) { 
@@ -443,9 +456,59 @@ internal void create_depth_buffer(Renderer* r, u32 width, u32 height) {
     r->device->CreateDepthStencilView(r->depth_buffer, &dsv_desc, cpu_descriptor_handle(&r->dsv_heap, r->depth_view));
 }
 
-Renderer* renderer_init(Arena* arena, void* window) {
-    Renderer* r = arena_push_struct_zero(arena, Renderer);
+internal ID3D12Resource* create_staging_buffer(ID3D12Device* device, void* data, u32 size) {
+    // TODO: pool these allocations - don't want to make a resource for every upload
 
+    D3D12_RESOURCE_DESC resource_desc = {};
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    resource_desc.Width = size;
+    resource_desc.Height = 1;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 1;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    ID3D12Resource* buf;
+    device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&buf));
+
+    void* mapped_ptr;
+    buf->Map(0, 0, &mapped_ptr);
+    memcpy(mapped_ptr, data, size);
+    buf->Unmap(0, 0);
+
+    return buf;
+}
+
+internal void append_releasable_resource(Renderer* r, ID3D12Resource* resource, ReleasableResource** target) {
+    ReleasableResource* rr;
+
+    if (!r->releasable_resource_slots) {
+        rr = arena_push_struct_zero(&r->arena, ReleasableResource);
+    }
+    else {
+        rr = r->releasable_resource_slots;
+        r->releasable_resource_slots = rr->next;
+    }
+
+    rr->resource = resource;
+    rr->next = *target;
+    *target = rr;
+}
+
+internal void release_releasable_resource(Renderer* r, ReleasableResource* rr) {
+    rr->resource->Release();
+    rr->next = r->releasable_resource_slots;
+    r->releasable_resource_slots = rr;
+}
+
+Renderer* renderer_init(Arena* arena, void* window) {
+    Scratch scratch = get_scratch(&arena, 1);
+    
+    Renderer* r = arena_push_struct_zero(arena, Renderer);
+    
     r->arena = arena_init(arena_push(arena, RENDERER_MEMORY_ARENA_SIZE), RENDERER_MEMORY_ARENA_SIZE);
 
     #if _DEBUG
@@ -514,13 +577,30 @@ Renderer* renderer_init(Arena* arena, void* window) {
     root_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_param.Constants.Num32BitValues = 16;
 
+    D3D12_STATIC_SAMPLER_DESC static_samplers[1] = {};
+    static_samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    static_samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    static_samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
+    static_samplers[0].ShaderRegister = 0;
+
     D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
     root_signature_desc.NumParameters = 1;
     root_signature_desc.pParameters = &root_param;
+    root_signature_desc.NumStaticSamplers = ARRAY_LEN(static_samplers);
+    root_signature_desc.pStaticSamplers = static_samplers;
     root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
 
-    ID3DBlob* root_signature_data;
-    D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &root_signature_data, 0);
+    ID3DBlob* root_signature_data, *root_signature_error;
+    D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &root_signature_data, &root_signature_error);
+
+    if (root_signature_error) {
+        debug_message("%s\n", root_signature_error->GetBufferPointer());
+        assert(false && "Root signature creation failed");
+        root_signature_error->Release();
+    }
+
     r->device->CreateRootSignature(0, root_signature_data->GetBufferPointer(), root_signature_data->GetBufferSize(), IID_PPV_ARGS(&r->root_signature));
     root_signature_data->Release();
 
@@ -606,6 +686,59 @@ Renderer* renderer_init(Arena* arena, void* window) {
         #endif
     }
 
+    RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
+
+    D3D12_RESOURCE_DESC texture_desc = {};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = 4;
+    texture_desc.Height = 4;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&r->texture));
+
+    u32 texture_data[16];
+    for (u32 i = 0; i < ARRAY_LEN(texture_data); ++i) {
+        texture_data[i] = 255;
+    }
+
+    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, sizeof(texture_data));
+    
+    D3D12_TEXTURE_COPY_LOCATION dest_loc = {};
+    dest_loc.pResource = r->texture;
+    dest_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+    src_loc.pResource = staging_texture;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src_loc.PlacedFootprint.Footprint.Format = texture_desc.Format;
+    src_loc.PlacedFootprint.Footprint.Width = (u32)texture_desc.Width;
+    src_loc.PlacedFootprint.Footprint.Height = texture_desc.Height;
+    src_loc.PlacedFootprint.Footprint.Depth = 1;
+    src_loc.PlacedFootprint.Footprint.RowPitch = 4 * sizeof(u32);
+        
+    upload_context->cmd->list->CopyTextureRegion(&dest_loc, 0, 0, 0, &src_loc, 0);
+    append_releasable_resource(r, staging_texture, &upload_context->releasable_resources);
+
+    r->texture_view = alloc_descriptor(&r->bindless_heap);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = texture_desc.Format;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = (u32)-1;
+
+    r->device->CreateShaderResourceView(r->texture, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, r->texture_view));
+
+    renderer_flush_upload(r, renderer_submit_upload_context(scratch.arena, r, upload_context));
+
+    release_scratch(scratch);
+
     return r;
 }
 
@@ -622,6 +755,8 @@ void renderer_release_backend(Renderer* r) {
         cmd->allocator->Release();
         cmd->list->Release();
     }
+
+    r->texture->Release();
 
     for (int i = 0; i < MESH_MEMORY_COUNT; ++i) {
         if (r->mesh_data[i].vbuffer) {
@@ -676,28 +811,6 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
     create_depth_buffer(r, width, height);
 
     debug_message("Resized swapchain (%d x %d)\n", width, height);
-}
-
-internal void append_releasable_resource(Renderer* r, ID3D12Resource* resource, ReleasableResource** target) {
-    ReleasableResource* rr;
-
-    if (!r->releasable_resource_slots) {
-        rr = arena_push_struct_zero(&r->arena, ReleasableResource);
-    }
-    else {
-        rr = r->releasable_resource_slots;
-        r->releasable_resource_slots = rr->next;
-    }
-
-    rr->resource = resource;
-    rr->next = *target;
-    *target = rr;
-}
-
-internal void release_releasable_resource(Renderer* r, ReleasableResource* rr) {
-    rr->resource->Release();
-    rr->next = r->releasable_resource_slots;
-    r->releasable_resource_slots = rr;
 }
 
 internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_size) {
@@ -815,6 +928,8 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     drop_constant_buffer(cmd, camera_cbuffer);
     cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
 
+    cmd->list->SetGraphicsRoot32BitConstant(0, r->texture_view.index, 4);
+
     for (u32 i = 0; i < queue_len; ++i) {
         MeshInstance* mesh_sub = &queue[i];
         MeshData* mesh_data = get_mesh_data(r, mesh_sub->mesh);
@@ -839,18 +954,8 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     r->swapchain_fences[swapchain_index] = command_queue_signal(&r->direct_queue);
 }
 
-struct RendererUploadContext {
-    CommandList* cmd;
-    ReleasableResource* releasable_resources;
-};
-
-struct RendererUploadTicket {
-    u64 fence_val;
-    ReleasableResource* releasable_resources;
-};
-
 RendererUploadContext* renderer_open_upload_context(Arena* arena, Renderer* r) {
-    RendererUploadContext* context = arena_push_struct(arena, RendererUploadContext);
+    RendererUploadContext* context = arena_push_struct_zero(arena, RendererUploadContext);
     context->cmd = open_command_list(r, D3D12_COMMAND_LIST_TYPE_COPY);
     return context;
 }
@@ -863,20 +968,29 @@ RendererUploadTicket* renderer_submit_upload_context(Arena* arena, Renderer* r, 
     return ticket;
 }
 
+internal void clear_upload_ticket(Renderer* r, RendererUploadTicket* ticket) {
+    for (ReleasableResource* n = ticket->releasable_resources; n;) {
+        ReleasableResource* next = n->next;
+        release_releasable_resource(r, n);
+        n = next;
+    }
+
+    ticket->releasable_resources = 0;
+}
+
 bool renderer_upload_finished(Renderer* r, RendererUploadTicket* ticket) {
     bool result = command_queue_reached(&r->copy_queue, ticket->fence_val);
 
     if (result) {
-        for (ReleasableResource* n = ticket->releasable_resources; n;) {
-            ReleasableResource* next = n->next;
-            release_releasable_resource(r, n);
-            n = next;
-        }
-
-        ticket->releasable_resources = 0;
+        clear_upload_ticket(r, ticket);
     }
 
     return result;
+}
+
+void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket) {
+    command_queue_wait(&r->copy_queue, ticket->fence_val);
+    clear_upload_ticket(r, ticket);
 }
 
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
@@ -891,8 +1005,6 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
 
     MeshData* data = &r->mesh_data[index];
 
-    ID3D12Resource* staging_vbuffer, *staging_ibuffer;
-
     D3D12_RESOURCE_DESC resource_desc = {};
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     resource_desc.Height = 1;
@@ -901,29 +1013,17 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     resource_desc.SampleDesc.Count = 1;
     resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    D3D12_HEAP_PROPERTIES upload_heap_props = {};
-    upload_heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-    D3D12_HEAP_PROPERTIES default_heap_props = {};
-    default_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_HEAP_PROPERTIES heap_props = {};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     resource_desc.Width = vertex_data_size;
-    r->device->CreateCommittedResource(&upload_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&staging_vbuffer));
-    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->vbuffer));
+    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->vbuffer));
 
     resource_desc.Width = index_data_size;
-    r->device->CreateCommittedResource(&upload_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&staging_ibuffer));
-    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->ibuffer));
+    r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->ibuffer));
 
-    void* mapped_ptr;
-
-    staging_vbuffer->Map(0, 0, &mapped_ptr);
-    memcpy(mapped_ptr, vertex_data, vertex_data_size);
-    staging_vbuffer->Unmap(0, 0);
-    
-    staging_ibuffer->Map(0, 0, &mapped_ptr);
-    memcpy(mapped_ptr, index_data, index_data_size);
-    staging_ibuffer->Unmap(0, 0);
+    ID3D12Resource* staging_vbuffer = create_staging_buffer(r->device, vertex_data, vertex_data_size);
+    ID3D12Resource* staging_ibuffer = create_staging_buffer(r->device, index_data, index_data_size);
 
     upload_context->cmd->list->CopyBufferRegion(data->vbuffer, 0, staging_vbuffer, 0, vertex_data_size);
     upload_context->cmd->list->CopyBufferRegion(data->ibuffer, 0, staging_ibuffer, 0, index_data_size);

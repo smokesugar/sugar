@@ -37,6 +37,7 @@ struct RendererUploadTicket;
 RendererUploadContext* renderer_open_upload_context(Arena* arena, Renderer* r);
 RendererUploadTicket* renderer_submit_upload_context(Arena* arena, Renderer* r, RendererUploadContext* context);
 bool renderer_upload_finished(Renderer* r, RendererUploadTicket* ticket);
+void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket);
 
 struct Vertex {
     XMFLOAT3 pos;

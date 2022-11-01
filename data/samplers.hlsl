@@ -1,0 +1,1 @@
+SamplerState linear_sampler : register(s0, space0);

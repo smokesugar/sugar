@@ -1,3 +1,5 @@
+#include "samplers.hlsl"
+
 struct Vertex {
     float3 pos;
     float3 norm;
@@ -11,6 +13,7 @@ struct MatrixStruct {
 struct VSOut {
     float4 sv_pos : SV_Position;
     float3 normal : Normal;
+    float2 uv : UV;
 };
 
 cbuffer DescriptorIndices : register(b0, space0)
@@ -19,6 +22,7 @@ cbuffer DescriptorIndices : register(b0, space0)
     uint di_vbuffer;
     uint di_ibuffer;
     uint di_transform;
+    uint di_texture;
 };
 
 VSOut vs_main(uint vertex_id : SV_VertexID) {
@@ -34,6 +38,7 @@ VSOut vs_main(uint vertex_id : SV_VertexID) {
     VSOut vso;
     vso.sv_pos = mul(camera.m, mul(transform.m, float4(vertex.pos, 1.0f)));
     vso.normal = normalize(mul((float3x3)transform.m, vertex.norm));
+    vso.uv = vertex.uv;
 
     return vso;
 }
@@ -42,7 +47,9 @@ float4 ps_main(VSOut vso) : SV_Target{
     float3 normal = normalize(vso.normal);
     float3 light_dir = normalize(float3(1.0f, 3.0f, 3.0f));
 
-    float3 diffuse_color = 1.0f.xxx;
+    Texture2D<float3> test_texture = ResourceDescriptorHeap[di_texture];
+
+    float3 diffuse_color = test_texture.Sample(linear_sampler, vso.uv);;
     float3 diffuse = max(dot(light_dir, normal), 0.0f) * diffuse_color;
 
     float3 ambient = 0.01f.xxx;
