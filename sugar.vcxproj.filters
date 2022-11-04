@@ -28,7 +28,9 @@
     <ClInclude Include="src\utility\json.h">
       <Filter>utility</Filter>
     </ClInclude>
-    <ClInclude Include="src\utility\resource_pool.h" />
+    <ClInclude Include="src\utility\resource_pool.h">
+      <Filter>utility</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\core\base.cpp">
@@ -43,10 +45,14 @@
     <ClCompile Include="src\renderer\renderer_d3d12.cpp">
       <Filter>renderer</Filter>
     </ClCompile>
+    <ClCompile Include="src\utility\extern_builds.cpp">
+      <Filter>utility</Filter>
+    </ClCompile>
     <ClCompile Include="src\utility\json.cpp">
       <Filter>utility</Filter>
     </ClCompile>
-    <ClCompile Include="src\utility\extern_builds.cpp" />
-    <ClCompile Include="src\utility\resource_pool.cpp" />
+    <ClCompile Include="src\utility\resource_pool.cpp">
+      <Filter>utility</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

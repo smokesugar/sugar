@@ -116,6 +116,11 @@ void write_file(char* path, void* data, u64 size) {
 struct WindowEvents {
     b32 closed;
     b32 resized;
+    b32 focused;
+    f32 mouse_dx;
+    f32 mouse_dy;
+    b32 key_down[256];
+    b32 key_up[256];
 };
 
 internal LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM w_param, LPARAM l_param) {
@@ -130,6 +135,50 @@ internal LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM w_param,
         case WM_CLOSE:
             events->closed = true;
             break;
+        case WM_SETFOCUS:
+            events->focused = true;
+            break;
+        case WM_INPUT: {
+            RAWINPUT raw_input;
+            UINT raw_input_size = sizeof(raw_input);
+            GetRawInputData((HRAWINPUT)l_param, RID_INPUT, &raw_input, &raw_input_size, sizeof(RAWINPUTHEADER));
+
+            switch (raw_input.header.dwType) {
+                case RIM_TYPEMOUSE:
+                    events->mouse_dx += (f32)raw_input.data.mouse.lLastX;
+                    events->mouse_dy += (f32)raw_input.data.mouse.lLastY;
+                    break;
+            }
+
+            result = DefWindowProcA(window, msg, w_param, l_param);
+        } break;
+
+        case WM_LBUTTONDOWN:
+            events->key_down[VK_LBUTTON] = true;
+            break;
+        case WM_RBUTTONDOWN:
+            events->key_down[VK_RBUTTON] = true;
+            break;
+        case WM_MBUTTONDOWN:
+            events->key_down[VK_MBUTTON] = true;
+            break;
+        case WM_KEYDOWN:
+            events->key_down[w_param] = true;
+            break;
+
+        case WM_LBUTTONUP:
+            events->key_up[VK_LBUTTON] = true;
+            break;
+        case WM_RBUTTONUP:
+            events->key_up[VK_RBUTTON] = true;
+            break;
+        case WM_MBUTTONUP:
+            events->key_up[VK_MBUTTON] = true;
+            break;
+        case WM_KEYUP:
+            events->key_up[w_param] = true;
+            break;
+
         default:
             result = DefWindowProcA(window, msg, w_param, l_param);
     }
@@ -139,6 +188,10 @@ internal LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM w_param,
 
 internal void* page_alloc(u64 size) {
     return VirtualAlloc(0, size, MEM_COMMIT, PAGE_READWRITE);
+}
+
+internal bool key_down(int key) {
+    return GetKeyState(key) & (1 << 15);
 }
 
 int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
@@ -178,6 +231,13 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     ShowWindow(window, SW_MAXIMIZE);
 
+    RAWINPUTDEVICE raw_input_mouse = {};
+    raw_input_mouse.usUsagePage = 0x01;
+    raw_input_mouse.usUsage = 0x02;
+    raw_input_mouse.hwndTarget = window;
+
+    RegisterRawInputDevices(&raw_input_mouse, 1, sizeof(RAWINPUTDEVICE));
+
     u64 perm_arena_size = 64 * 1024u * 1024u;
     u64 frame_arena_size = 3 * 1024 * 1024;
     Arena perm_arena = arena_init(page_alloc(perm_arena_size), perm_arena_size);
@@ -186,7 +246,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     Renderer* renderer = renderer_init(&perm_arena, window);
 
     RendererUploadContext* upload_context = renderer_open_upload_context(&perm_arena, renderer);
-    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, upload_context, "models/as-val.glb");
+    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, upload_context, "models/suzanne.gltf");
     RendererUploadTicket* upload_ticket = renderer_submit_upload_context(&perm_arena, renderer, upload_context);
 
     for (u32 i = 0; i < gltf.num_instances; ++i) {
@@ -194,6 +254,13 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     }
 
     f32 last_time = engine_time();
+
+    bool in_camera = false;
+
+    XMVECTOR camera_position = { 0.0f, 0.0f, 3.0f };
+    XMVECTOR camera_velocity = {};
+    f32 camera_yaw = 0.0f;
+    f32 camera_pitch = 0.0f;
 
     while (true) {
         arena_clear(&frame_arena);
@@ -212,19 +279,101 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         if (events.closed) {
             break;
         }
-
+        
         if (events.resized) {
             RECT client_rect;
             GetClientRect(window, &client_rect);
-            renderer_handle_resize(renderer, client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
+
+            u32 window_width = client_rect.right - client_rect.left;
+            u32 window_height = client_rect.bottom - client_rect.top;
+
+            renderer_handle_resize(renderer, window_width, window_height);
         }
 
-        for (u32 i = 0; i < gltf.num_instances; ++i) {
-            gltf.instances[i].transform *= XMMatrixRotationRollPitchYaw(0.0f, dt * PI32, 0.0f);
+        if (in_camera && events.focused) {
+            ShowCursor(true);
+            in_camera = false;
         }
+
+        if (in_camera) {
+            f32 look_sensitivity = 0.001f;
+            camera_yaw -= events.mouse_dx * look_sensitivity;
+            camera_pitch -= events.mouse_dy * look_sensitivity;
+
+            if (camera_pitch > PI32 / 2) {
+                camera_pitch = PI32 / 2;
+            }
+
+            if (camera_pitch < -PI32 / 2) {
+                camera_pitch = -PI32 / 2;
+            }
+
+            XMVECTOR camera_quaternion = XMQuaternionRotationRollPitchYaw(camera_pitch, camera_yaw, 0.0f);
+            XMMATRIX camera_rotation_matrix = XMMatrixRotationQuaternion(camera_quaternion);
+
+            XMVECTOR forward = XMVector3Rotate({ 0.0f, 0.0f, -1.0f }, camera_quaternion);
+            XMVECTOR up = XMVECTOR{ 0.0f, 1.0f, 0.0f };
+            XMVECTOR right = XMVector3Cross(forward, up);
+
+            XMVECTOR camera_acceleration = {};
+
+            if (key_down(VK_SPACE)) {
+                camera_acceleration += up;
+            }
+
+            if (key_down(VK_LSHIFT)) {
+                camera_acceleration -= up;
+            }
+
+            if (key_down('W')) {
+                camera_acceleration += forward;
+            }
+
+            if (key_down('S')) {
+                camera_acceleration -= forward;
+            }
+
+            if (key_down('D')) {
+                camera_acceleration += right;
+            }
+
+            if (key_down('A')) {
+                camera_acceleration -= right;
+            }
+
+            f32 acceleration_amount = 50.0f;
+            f32 friction_amount = 10.0f;
+            camera_acceleration = XMVector3Normalize(camera_acceleration) * acceleration_amount;
+            camera_acceleration -= camera_velocity * friction_amount;
+
+            camera_velocity += camera_acceleration * dt;
+            camera_position += camera_velocity * dt;
+
+            if (events.key_up[VK_ESCAPE]) {
+                ShowCursor(true);
+                ClipCursor(0);
+                in_camera = false;
+            }
+        }
+        else {
+            if (events.key_down[VK_LBUTTON]) {
+                RECT rect;
+                GetClientRect(window, &rect);
+
+                ClientToScreen(window, (POINT*)&rect.left); // A bit cursed.
+                ClientToScreen(window, (POINT*)&rect.right);
+
+                ShowCursor(false);
+                ClipCursor(&rect);
+                in_camera = true;
+            }
+        }
+
+        XMMATRIX camera_rotation_matrix = XMMatrixRotationRollPitchYaw(camera_pitch, camera_yaw, 0.0f);
+        XMMATRIX camera_translation_matrix = XMMatrixTranslationFromVector(camera_position);
 
         Camera camera;
-        camera.transform = XMMatrixTranslation(0.0f, 0.0f, 3.0f);
+        camera.transform = camera_rotation_matrix * camera_translation_matrix;
         camera.fov = PI32 * 0.5f;
 
         MeshInstance* queue = 0;
