@@ -175,7 +175,7 @@ internal XMVECTOR extract_json_vector(Json* j) {
     return result;
 }
 
-internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, Json* root, GLTFBuffer* buffers, u32 num_buffers) {
+internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* dir, Json* root, GLTFBuffer* buffers, u32 num_buffers) {
     UNUSED(num_buffers);
 
     Scratch scratch = get_scratch(&arena, 1);
@@ -258,7 +258,9 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
             u64 compressed_memory_size = 0;
 
             if (Json* uri = json_query(asset_image, "uri")) {
-                ReadFileResult file = read_file(image_scratch.arena, uri->string);
+                char absolute_uri[1024];
+                sprintf_s(absolute_uri, sizeof(absolute_uri), "%s%s", dir, uri->string);
+                ReadFileResult file = read_file(image_scratch.arena, absolute_uri);
                 compressed_memory = file.memory;
                 compressed_memory_size = file.size;
             }
@@ -493,6 +495,26 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
     return result;
 }
 
+internal void get_directory(char* path, char* buf, u64 buf_size) {
+    {
+        strcpy_s(buf, buf_size, path);
+
+        for (char* c = buf; *c; ++c) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+
+        char* last_slash = strrchr(buf, '/');
+        if (last_slash) {
+            last_slash[1] = '\0';
+        }
+        else {
+            buf[0] = '\0';
+        }
+    }
+}
+
 internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* path) {
     Scratch scratch = get_scratch(&arena, 1);
 
@@ -500,6 +522,9 @@ internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, Renderer
     ReadFileResult file = read_file(scratch.arena, path);
     u8* file_cursor = (u8*)file.memory;
     u8* file_end = file_cursor + file.size;
+
+    char dir[1024];
+    get_directory(path, dir, sizeof(dir));
 
     GLBHeader* header = (GLBHeader*)file_cursor;
     file_cursor += sizeof(*header);
@@ -537,9 +562,7 @@ internal LoadGLTFResult load_gltf_glb(Arena* arena, Renderer* renderer, Renderer
     #undef READ_CHUNK
 
     Json* root = parse_json_string(scratch.arena, json_string);
-    Json* ahd = json_query(root, "buffers");
-    UNUSED(ahd);
-    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, root, buffers, num_buffers);
+    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, dir, root, buffers, num_buffers);
         
     release_scratch(scratch_2);
     release_scratch(scratch);
@@ -555,23 +578,7 @@ internal LoadGLTFResult load_gltf_gltf(Arena* arena, Renderer* renderer, Rendere
     Json* root = parse_json_string(scratch.arena, file.memory);
 
     char dir[1024];
-    {
-        strcpy_s(dir, sizeof(dir), path);
-
-        for (char* c = dir; *c; ++c) {
-            if (*c == '\\') {
-                *c = '/';
-            }
-        }
-
-        char* last_slash = strrchr(dir, '/');
-        if (last_slash) {
-            last_slash[1] = '\0';
-        }
-        else {
-            dir[0] = '\0';
-        }
-    }
+    get_directory(path, dir, sizeof(dir));
 
     assert(strcmp(json_query(json_query(root, "asset"), "version")->string, "2.0") == 0 && "Unsupported GLTF version");
 
@@ -601,7 +608,7 @@ internal LoadGLTFResult load_gltf_gltf(Arena* arena, Renderer* renderer, Rendere
         }
     }
 
-    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, root, buffers, num_buffers);
+    LoadGLTFResult result = process_gltf(arena, renderer, upload_context, dir, root, buffers, num_buffers);
 
     release_scratch(scratch);
 

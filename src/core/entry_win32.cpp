@@ -246,7 +246,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     Renderer* renderer = renderer_init(&perm_arena, window);
 
     RendererUploadContext* upload_context = renderer_open_upload_context(&perm_arena, renderer);
-    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, upload_context, "models/suzanne.gltf");
+    LoadGLTFResult gltf = load_gltf(&perm_arena, renderer, upload_context, "models/bistro/bistro.gltf");
     RendererUploadTicket* upload_ticket = renderer_submit_upload_context(&perm_arena, renderer, upload_context);
 
     for (u32 i = 0; i < gltf.num_instances; ++i) {
@@ -288,11 +288,6 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             u32 window_height = client_rect.bottom - client_rect.top;
 
             renderer_handle_resize(renderer, window_width, window_height);
-        }
-
-        if (in_camera && events.focused) {
-            ShowCursor(true);
-            in_camera = false;
         }
 
         if (in_camera) {
@@ -349,7 +344,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             camera_velocity += camera_acceleration * dt;
             camera_position += camera_velocity * dt;
 
-            if (events.key_up[VK_ESCAPE]) {
+            if (events.key_up[VK_ESCAPE] || events.focused) {
                 ShowCursor(true);
                 ClipCursor(0);
                 in_camera = false;
