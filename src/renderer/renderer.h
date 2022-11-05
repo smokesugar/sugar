@@ -26,12 +26,26 @@ struct MeshInstance {
     XMMATRIX transform;
 };
 
-struct Camera {
+struct RendererCamera {
     XMMATRIX transform;
+    f32 near_plane;
+    f32 far_plane;
     f32 fov;
 };
 
-void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len);
+struct RendererFrameData {
+    RendererCamera* camera;
+
+    MeshInstance* queue;
+    u32 queue_len;
+
+    u32 num_line_vertices;
+    u32 num_line_indices;
+    XMFLOAT4* line_vertices;
+    u32* line_indices;
+};
+
+void renderer_render_frame(Renderer* r, RendererFrameData* frame);
 
 Material renderer_get_default_material(Renderer* r);
 

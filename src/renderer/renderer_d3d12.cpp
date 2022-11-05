@@ -22,6 +22,9 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define MAX_MESHES (8 * 1024)
 #define MAX_MATERIALS (8 * 1024)
 
+#define WRITABLE_MESH_VBUFFER_SIZE 1024
+#define WRITABLE_MESH_IBUFFER_SIZE 1024
+
 struct Descriptor {
     #if _DEBUG
         u32 meta;
@@ -132,13 +135,21 @@ internal D3D12_GPU_DESCRIPTOR_HANDLE gpu_descriptor_handle(DescriptorHeap* heap,
 struct ConstantBuffer {
     ConstantBuffer* next;
     void* ptr;
-    Descriptor view;
+    Descriptor cbv;
 };
 
 struct CommandQueue {
     ID3D12CommandQueue* queue;
     u64 fence_val;
     ID3D12Fence* fence;
+};
+
+struct WritableMesh {
+    WritableMesh* next;
+    void* vbuffer_ptr;
+    void* ibuffer_ptr;
+    Descriptor vbuffer_view;
+    Descriptor ibuffer_view;
 };
 
 struct CommandList {
@@ -148,7 +159,8 @@ struct CommandList {
     CommandQueue* queue;
     ID3D12CommandAllocator* allocator;
     ID3D12GraphicsCommandList* list;
-    ConstantBuffer* constant_buffer_list;
+    ConstantBuffer* constant_buffers;
+    WritableMesh* writable_meshes;
 };
 
 struct ReleasableResource {
@@ -239,7 +251,8 @@ struct Renderer {
     u64 swapchain_fences[DXGI_MAX_SWAP_CHAIN_BUFFERS];
     Descriptor swapchain_rtvs[DXGI_MAX_SWAP_CHAIN_BUFFERS];
 
-    ConstantBuffer* available_constant_buffer_list;
+    ConstantBuffer* available_constant_buffers;
+    WritableMesh* available_writable_meshes;
 
     CommandList* available_command_lists;
     CommandList* executing_command_lists;
@@ -248,7 +261,9 @@ struct Renderer {
     ReleasableResource* garbage;
     #endif
 
-    ID3D12PipelineState* pipeline;
+    ID3D12PipelineState* lighting_pipeline;
+    ID3D12PipelineState* line_pipeline;
+
     ID3D12Resource* depth_buffer;
     Descriptor depth_view;
 
@@ -266,14 +281,24 @@ internal void update_available_command_lists(Renderer* r) {
         {
             // Add all constant buffers back into available pool
 
-            if (cmd->constant_buffer_list) {
-                ConstantBuffer* n = cmd->constant_buffer_list;
+            if (cmd->constant_buffers) {
+                ConstantBuffer* n = cmd->constant_buffers;
                 while (n->next) {
                     n = n->next;
                 }
-                n->next = r->available_constant_buffer_list;
-                r->available_constant_buffer_list = cmd->constant_buffer_list;
-                cmd->constant_buffer_list = NULL;
+                n->next = r->available_constant_buffers;
+                r->available_constant_buffers = cmd->constant_buffers;
+                cmd->constant_buffers = 0;
+            }
+
+            if (cmd->writable_meshes) {
+                WritableMesh* n = cmd->writable_meshes;
+                while (n->next) {
+                    n = n->next;
+                }
+                n->next = r->available_writable_meshes;
+                r->available_writable_meshes = cmd->writable_meshes;
+                cmd->writable_meshes = 0;
             }
 
             // Add command list into available list
@@ -508,6 +533,50 @@ internal void release_releasable_resource(Renderer* r, ReleasableResource* rr) {
     r->releasable_resource_slots = rr;
 }
 
+internal D3D12_GRAPHICS_PIPELINE_STATE_DESC fill_graphics_pipeline_desc(Renderer* r, IDxcBlob* vs, IDxcBlob* ps, DXGI_FORMAT depth_format) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC result = {};
+
+    result.pRootSignature = r->root_signature;
+
+    result.VS.BytecodeLength = vs->GetBufferSize();
+    result.VS.pShaderBytecode = vs->GetBufferPointer();
+    result.PS.BytecodeLength = ps->GetBufferSize();
+    result.PS.pShaderBytecode = ps->GetBufferPointer();
+
+    for (int i = 0; i < ARRAY_LEN(result.BlendState.RenderTarget); ++i) {
+        D3D12_RENDER_TARGET_BLEND_DESC* blend = result.BlendState.RenderTarget + i;
+        blend->SrcBlend = D3D12_BLEND_ONE;
+        blend->DestBlend = D3D12_BLEND_ZERO;
+        blend->BlendOp = D3D12_BLEND_OP_ADD;
+        blend->SrcBlendAlpha = D3D12_BLEND_ONE;
+        blend->DestBlendAlpha = D3D12_BLEND_ZERO;
+        blend->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend->LogicOp = D3D12_LOGIC_OP_NOOP;
+        blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    result.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
+
+    result.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    result.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    result.RasterizerState.DepthClipEnable = TRUE;
+    result.RasterizerState.FrontCounterClockwise = TRUE;
+
+    result.DepthStencilState.DepthEnable = depth_format != DXGI_FORMAT_UNKNOWN;
+    result.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    result.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+
+    result.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    result.NumRenderTargets = 1;
+    result.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    result.DSVFormat = depth_format;
+
+    result.SampleDesc.Count = 1;
+
+    return result;
+}
+
 Renderer* renderer_init(Arena* arena, void* window) {
     Scratch scratch = get_scratch(&arena, 1);
     
@@ -633,52 +702,22 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     get_swapchain_buffers_and_create_rtvs(r);
 
-    IDxcBlob* vs = compile_shader("shader.hlsl", "vs_main", "vs_6_6");
-    IDxcBlob* ps = compile_shader("shader.hlsl", "ps_main", "ps_6_6");
+    IDxcBlob* lighting_vs = compile_shader("lighting.hlsl", "vs_main", "vs_6_6");
+    IDxcBlob* lighting_ps = compile_shader("lighting.hlsl", "ps_main", "ps_6_6");
+    IDxcBlob* line_vs = compile_shader("line.hlsl", "vs_main", "vs_6_6");
+    IDxcBlob* line_ps = compile_shader("line.hlsl", "ps_main", "ps_6_6");
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
-    pso_desc.pRootSignature = r->root_signature;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC lighting_pipeline_desc = fill_graphics_pipeline_desc(r, lighting_vs, lighting_ps, DXGI_FORMAT_D32_FLOAT);
+    r->device->CreateGraphicsPipelineState(&lighting_pipeline_desc, IID_PPV_ARGS(&r->lighting_pipeline));
 
-    pso_desc.VS.BytecodeLength = vs->GetBufferSize();
-    pso_desc.VS.pShaderBytecode = vs->GetBufferPointer();
-    pso_desc.PS.BytecodeLength = ps->GetBufferSize();
-    pso_desc.PS.pShaderBytecode = ps->GetBufferPointer();
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC line_pipeline_desc = fill_graphics_pipeline_desc(r, line_vs, line_ps, DXGI_FORMAT_D32_FLOAT);
+    line_pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    r->device->CreateGraphicsPipelineState(&line_pipeline_desc, IID_PPV_ARGS(&r->line_pipeline));
 
-    for (int i = 0; i < ARRAY_LEN(pso_desc.BlendState.RenderTarget); ++i) {
-        D3D12_RENDER_TARGET_BLEND_DESC* blend = pso_desc.BlendState.RenderTarget + i;
-        blend->SrcBlend = D3D12_BLEND_ONE;
-        blend->DestBlend = D3D12_BLEND_ZERO;
-        blend->BlendOp = D3D12_BLEND_OP_ADD;
-        blend->SrcBlendAlpha = D3D12_BLEND_ONE;
-        blend->DestBlendAlpha = D3D12_BLEND_ZERO;
-        blend->BlendOpAlpha = D3D12_BLEND_OP_ADD;
-        blend->LogicOp = D3D12_LOGIC_OP_NOOP;
-        blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    }
-
-    pso_desc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
-
-    pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
-    pso_desc.RasterizerState.DepthClipEnable = TRUE;
-    pso_desc.RasterizerState.FrontCounterClockwise = TRUE;
-
-    pso_desc.DepthStencilState.DepthEnable = TRUE;
-    pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
-
-    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-
-    pso_desc.NumRenderTargets = 1;
-    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pso_desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-
-    pso_desc.SampleDesc.Count = 1;
-
-    r->device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&r->pipeline));
-
-    vs->Release();
-    ps->Release();
+    lighting_vs->Release();
+    lighting_ps->Release();
+    line_vs->Release();
+    line_ps->Release();
 
     r->depth_view = alloc_descriptor(&r->dsv_heap);
     create_depth_buffer(r, swapchain_desc.Width, swapchain_desc.Height);
@@ -688,8 +727,8 @@ Renderer* renderer_init(Arena* arena, void* window) {
 
     RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
 
-    u32 default_texture_data = UINT32_MAX;
-    r->default_material = renderer_new_material(r, upload_context, 1, 1, &default_texture_data);
+    u8 default_texture_data[4] = { 128, 128, 128, 128 };
+    r->default_material = renderer_new_material(r, upload_context, 1, 1, default_texture_data);
 
     renderer_flush_upload(r, renderer_submit_upload_context(scratch.arena, r, upload_context));
 
@@ -722,7 +761,9 @@ void renderer_release_backend(Renderer* r) {
     assert(resource_pool_num_allocations(r->material_pool) == 0 && "Outstanding materials. Free all materials in debug builds.");
 
     r->depth_buffer->Release();
-    r->pipeline->Release();
+
+    r->line_pipeline->Release();
+    r->lighting_pipeline->Release();
 
     #if _DEBUG
     for (ReleasableResource* n = r->garbage; n; n = n->next) {
@@ -770,7 +811,7 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
 }
 
 internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_size) {
-    if (!r->available_constant_buffer_list) {
+    if (!r->available_constant_buffers) {
         debug_message("Creating a constant buffer pool (%d constant buffers)\n", CONSTANT_BUFFER_POOL_SIZE);
 
         D3D12_RESOURCE_DESC resource_desc = {};
@@ -797,39 +838,110 @@ internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_s
         D3D12_GPU_VIRTUAL_ADDRESS base_gpu = resource->GetGPUVirtualAddress();
 
         for (int i = 0; i < CONSTANT_BUFFER_POOL_SIZE; ++i) {
-            ConstantBuffer* cbuffer = arena_push_struct(&r->arena, ConstantBuffer);
+            ConstantBuffer* buf = arena_push_struct(&r->arena, ConstantBuffer);
 
             u64 offset = i * CONSTANT_BUFFER_SIZE;
 
-            cbuffer->next = r->available_constant_buffer_list;
-            cbuffer->ptr = (u8*)base + offset;
-            cbuffer->view = alloc_descriptor(&r->bindless_heap);
+            buf->next = r->available_constant_buffers;
+            buf->ptr = (u8*)base + offset;
+            buf->cbv = alloc_descriptor(&r->bindless_heap);
 
             D3D12_CONSTANT_BUFFER_VIEW_DESC view_desc = {};
             view_desc.BufferLocation = base_gpu + offset;
             view_desc.SizeInBytes = CONSTANT_BUFFER_SIZE;
 
-            r->device->CreateConstantBufferView(&view_desc, cpu_descriptor_handle(&r->bindless_heap, cbuffer->view));
+            r->device->CreateConstantBufferView(&view_desc, cpu_descriptor_handle(&r->bindless_heap, buf->cbv));
 
-            r->available_constant_buffer_list = cbuffer;
+            r->available_constant_buffers = buf;
         }
     }
 
-    ConstantBuffer* cbuffer = r->available_constant_buffer_list;
-    r->available_constant_buffer_list = cbuffer->next;
+    ConstantBuffer* buf = r->available_constant_buffers;
+    r->available_constant_buffers = buf->next;
 
     assert(data_size <= CONSTANT_BUFFER_SIZE);
-    memcpy(cbuffer->ptr, data, data_size);
+    memcpy(buf->ptr, data, data_size);
 
-    return cbuffer;
+    return buf;
 }
 
-internal void drop_constant_buffer(CommandList* cmd, ConstantBuffer* cbuffer) {
-    cbuffer->next = cmd->constant_buffer_list;
-    cmd->constant_buffer_list = cbuffer;
+internal void drop_constant_buffer(CommandList* cmd, ConstantBuffer* buf) {
+    buf->next = cmd->constant_buffers;
+    cmd->constant_buffers = buf;
 }
 
-void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32 queue_len) {
+internal WritableMesh* get_writable_mesh(Renderer* r, XMFLOAT4* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
+    WritableMesh* writable_mesh;
+
+    if (r->available_writable_meshes) {
+        writable_mesh = r->available_writable_meshes;
+        r->available_writable_meshes = r->available_writable_meshes->next;
+    }
+    else {
+        writable_mesh = arena_push_struct_zero(&r->arena, WritableMesh);
+
+        D3D12_RESOURCE_DESC resource_desc = {};
+        resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        resource_desc.Height = 1;
+        resource_desc.DepthOrArraySize = 1;
+        resource_desc.MipLevels = 1;
+        resource_desc.SampleDesc.Count = 1;
+        resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        ID3D12Resource* vbuffer = 0;
+        ID3D12Resource* ibuffer = 0;
+
+        resource_desc.Width = WRITABLE_MESH_VBUFFER_SIZE;
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&vbuffer));
+
+        resource_desc.Width = WRITABLE_MESH_IBUFFER_SIZE;
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&ibuffer));
+
+        writable_mesh->vbuffer_view = alloc_descriptor(&r->bindless_heap);
+        writable_mesh->ibuffer_view = alloc_descriptor(&r->bindless_heap);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+        srv_desc.Buffer.NumElements = WRITABLE_MESH_VBUFFER_SIZE / sizeof(XMFLOAT4);
+        srv_desc.Buffer.StructureByteStride = sizeof(XMFLOAT4);
+        r->device->CreateShaderResourceView(vbuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, writable_mesh->vbuffer_view));
+
+        srv_desc.Buffer.NumElements = WRITABLE_MESH_IBUFFER_SIZE / sizeof(u32);
+        srv_desc.Buffer.StructureByteStride = sizeof(u32);
+        r->device->CreateShaderResourceView(ibuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, writable_mesh->ibuffer_view));
+
+        append_releasable_resource(r, vbuffer, &r->garbage);
+        append_releasable_resource(r, ibuffer, &r->garbage);
+
+        vbuffer->Map(0, 0, &writable_mesh->vbuffer_ptr);
+        ibuffer->Map(0, 0, &writable_mesh->ibuffer_ptr);
+
+        debug_message("Created a writable mesh.\n");
+    }
+
+    u64 vertex_data_size = vertex_count * sizeof(XMFLOAT4);
+    u64 index_data_size = index_count * sizeof(u32);
+
+    assert(vertex_data_size <= WRITABLE_MESH_VBUFFER_SIZE);
+    assert(index_data_size <= WRITABLE_MESH_IBUFFER_SIZE);
+
+    memcpy(writable_mesh->vbuffer_ptr, vertex_data, vertex_data_size);
+    memcpy(writable_mesh->ibuffer_ptr, index_data, index_data_size);
+
+    return writable_mesh;
+}
+
+internal void drop_writable_mesh(CommandList* cmd, WritableMesh* writable_mesh) {
+    writable_mesh->next = cmd->writable_meshes;
+    cmd->writable_meshes = writable_mesh;
+}
+
+void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     r->swapchain->GetDesc1(&swapchain_desc);
 
@@ -868,18 +980,18 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
     cmd->list->RSSetViewports(1, &viewport);
 
     cmd->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cmd->list->SetPipelineState(r->pipeline);
+    cmd->list->SetPipelineState(r->lighting_pipeline);
 
     f32 aspect_ratio = (f32)swapchain_desc.Width / (f32)swapchain_desc.Height;
-    XMMATRIX view_matrix = XMMatrixInverse(0, camera->transform);
-    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(camera->fov/aspect_ratio, aspect_ratio, 1000.0f, 0.1f);
+    XMMATRIX view_matrix = XMMatrixInverse(0, frame->camera->transform);
+    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(frame->camera->fov/aspect_ratio, aspect_ratio, frame->camera->far_plane, frame->camera->near_plane);
     XMMATRIX view_projection = view_matrix * projection_matrix;
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
     drop_constant_buffer(cmd, camera_cbuffer);
-    cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->view.index, 0);
+    cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
 
-    for (u32 i = 0; i < queue_len; ++i) {
-        MeshInstance* instance = &queue[i];
+    for (u32 i = 0; i < frame->queue_len; ++i) {
+        MeshInstance* instance = &frame->queue[i];
 
         MeshData* mesh_data = resource_pool_access(r->mesh_pool, instance->mesh.handle, MeshData);
         MaterialData* mat_data = resource_pool_access(r->material_pool, instance->material.handle, MaterialData);
@@ -889,11 +1001,22 @@ void renderer_render_frame(Renderer* r, Camera* camera, MeshInstance* queue, u32
 
         cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
         cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->ibuffer_view.index, 2);
-        cmd->list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->view.index, 3);
+        cmd->list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->cbv.index, 3);
         cmd->list->SetGraphicsRoot32BitConstant(0, mat_data->texture_view.index, 4);
 
-
         cmd->list->DrawInstanced(mesh_data->index_count, 1, 0, 0);
+    }
+
+    if (frame->num_line_indices > 0) {
+        WritableMesh* writable_mesh = get_writable_mesh(r, frame->line_vertices, frame->num_line_vertices, frame->line_indices, frame->num_line_indices);
+        drop_writable_mesh(cmd, writable_mesh);
+
+        cmd->list->SetPipelineState(r->line_pipeline);
+        cmd->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+        cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
+        cmd->list->SetGraphicsRoot32BitConstant(0, writable_mesh->vbuffer_view.index, 1);
+        cmd->list->SetGraphicsRoot32BitConstant(0, writable_mesh->ibuffer_view.index, 2);
+        cmd->list->DrawInstanced(frame->num_line_indices, 1, 0, 0);
     }
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

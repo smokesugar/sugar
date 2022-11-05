@@ -1,13 +1,9 @@
-#include "samplers.hlsl"
+#include "common.hlsl"
 
 struct Vertex {
     float3 pos;
     float3 norm;
     float2 uv;
-};
-
-struct MatrixStruct {
-    float4x4 m;
 };
 
 struct VSOut {

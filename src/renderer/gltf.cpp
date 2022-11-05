@@ -7,7 +7,7 @@
 #include "gltf.h"
 #include "utility/json.h"
 
-#define IGNORE_MATERIALS 0
+#define IGNORE_MATERIALS 1
 
 struct GLTFBuffer {
     u64 len;

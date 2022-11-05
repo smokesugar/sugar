@@ -200,6 +200,17 @@ internal bool key_down(int key) {
     return GetKeyState(key) & (1 << 15);
 }
 
+struct Camera {
+    XMVECTOR position;
+    XMVECTOR velocity;
+    f32 yaw;
+    f32 pitch;
+    f32 near_plane;
+    f32 far_plane;
+    f32 target_fov;
+    f32 fov;
+};
+
 int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     QueryPerformanceCounter(&counter_start);
     QueryPerformanceFrequency(&counter_freq);
@@ -263,12 +274,19 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     bool in_camera = false;
 
-    XMVECTOR camera_position = { 0.0f, 0.0f, 3.0f };
-    XMVECTOR camera_velocity = {};
-    f32 camera_yaw = 0.0f;
-    f32 camera_pitch = 0.0f;
-    f32 target_camera_fov = PI32 * 0.5f;
-    f32 camera_fov = PI32 * 0.5f;
+    Camera cameras[2] = {};
+    cameras[0].position = { -1.0f, 0.0f, 3.0f };
+    cameras[0].near_plane = 0.1f;
+    cameras[0].far_plane = 10.0f;
+    cameras[0].target_fov = PI32 * 0.5f;
+    cameras[0].fov = cameras[0].target_fov;
+    cameras[1].position = { 1.0f, 0.0f, 3.0f };
+    cameras[1].near_plane = 0.1f;
+    cameras[1].far_plane = 1000.0f;
+    cameras[1].target_fov = PI32 * 0.5f;
+    cameras[1].fov = cameras[1].target_fov;
+
+    int camera_index = 0;
 
     while (true) {
         arena_clear(&frame_arena);
@@ -287,33 +305,39 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         if (events.closed) {
             break;
         }
+
+        RECT client_rect;
+        GetClientRect(window, &client_rect);
+
+        u32 window_width = client_rect.right - client_rect.left;
+        u32 window_height = client_rect.bottom - client_rect.top;
         
         if (events.resized) {
-            RECT client_rect;
-            GetClientRect(window, &client_rect);
-
-            u32 window_width = client_rect.right - client_rect.left;
-            u32 window_height = client_rect.bottom - client_rect.top;
-
             renderer_handle_resize(renderer, window_width, window_height);
         }
 
-        camera_fov += (target_camera_fov - camera_fov) * dt * 10.0f;
+        if (events.key_up['C']) {
+            camera_index = (camera_index + 1) % 2;
+        }
+
+        Camera* camera = &cameras[camera_index];
+
+        camera->fov += (camera->target_fov - camera->fov) * dt * 10.0f;
 
         if (in_camera) {
             f32 look_sensitivity = 0.001f;
-            camera_yaw -= events.mouse_dx * look_sensitivity;
-            camera_pitch -= events.mouse_dy * look_sensitivity;
+            camera->yaw -= events.mouse_dx * look_sensitivity;
+            camera->pitch -= events.mouse_dy * look_sensitivity;
 
-            if (camera_pitch > PI32 / 2) {
-                camera_pitch = PI32 / 2;
+            if (camera->pitch > PI32 / 2) {
+                camera->pitch = PI32 / 2;
             }
 
-            if (camera_pitch < -PI32 / 2) {
-                camera_pitch = -PI32 / 2;
+            if (camera->pitch < -PI32 / 2) {
+                camera->pitch = -PI32 / 2;
             }
 
-            XMVECTOR camera_quaternion = XMQuaternionRotationRollPitchYaw(camera_pitch, camera_yaw, 0.0f);
+            XMVECTOR camera_quaternion = XMQuaternionRotationRollPitchYaw(camera->pitch, camera->yaw, 0.0f);
             XMMATRIX camera_rotation_matrix = XMMatrixRotationQuaternion(camera_quaternion);
 
             XMVECTOR forward = XMVector3Rotate({ 0.0f, 0.0f, -1.0f }, camera_quaternion);
@@ -349,19 +373,19 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             f32 acceleration_amount = 50.0f;
             f32 friction_amount = 10.0f;
             camera_acceleration = XMVector3Normalize(camera_acceleration) * acceleration_amount;
-            camera_acceleration -= camera_velocity * friction_amount;
+            camera_acceleration -= camera->velocity * friction_amount;
 
-            camera_velocity += camera_acceleration * dt;
-            camera_position += camera_velocity * dt;
+            camera->velocity += camera_acceleration * dt;
+            camera->position += camera->velocity * dt;
 
-            target_camera_fov -= events.mouse_wheel_delta * (PI32 / 12);
+            camera->target_fov -= events.mouse_wheel_delta * (PI32 / 12);
 
-            if (target_camera_fov > PI32*0.9f) {
-                target_camera_fov = PI32*0.9f;
+            if (camera->target_fov > PI32*0.9f) {
+                camera->target_fov = PI32*0.9f;
             }
 
-            if (target_camera_fov < PI32/6.0f) {
-                target_camera_fov = PI32/6.0f;
+            if (camera->target_fov < PI32/6.0f) {
+                camera->target_fov = PI32/6.0f;
             }
 
             if (events.key_up[VK_ESCAPE] || events.focused) {
@@ -384,12 +408,14 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             }
         }
 
-        XMMATRIX camera_rotation_matrix = XMMatrixRotationRollPitchYaw(camera_pitch, camera_yaw, 0.0f);
-        XMMATRIX camera_translation_matrix = XMMatrixTranslationFromVector(camera_position);
+        XMMATRIX camera_rotation_matrix = XMMatrixRotationRollPitchYaw(camera->pitch, camera->yaw, 0.0f);
+        XMMATRIX camera_translation_matrix = XMMatrixTranslationFromVector(camera->position);
 
-        Camera camera;
-        camera.transform = camera_rotation_matrix * camera_translation_matrix;
-        camera.fov = camera_fov;
+        RendererCamera renderer_camera;
+        renderer_camera.transform = camera_rotation_matrix * camera_translation_matrix;
+        renderer_camera.near_plane = camera->near_plane;
+        renderer_camera.far_plane = camera->far_plane;
+        renderer_camera.fov = camera->fov;
 
         MeshInstance* queue = 0;
         int queue_len = 0;
@@ -400,7 +426,48 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             queue_len = gltf.num_instances;
         }
 
-        renderer_render_frame(renderer, &camera, queue, queue_len);
+        XMVECTOR frustum_vertices[] = {
+            { -1.0f,  1.0f, 0.0f, 1.0f },
+            {  1.0f,  1.0f, 0.0f, 1.0f },
+            {  1.0f, -1.0f, 0.0f, 1.0f },
+            { -1.0f, -1.0f, 0.0f, 1.0f },
+
+            { -1.0f,  1.0f, 1.0f, 1.0f },
+            {  1.0f,  1.0f, 1.0f, 1.0f },
+            {  1.0f, -1.0f, 1.0f, 1.0f },
+            { -1.0f, -1.0f, 1.0f, 1.0f },
+
+        };
+
+        u32 line_indices[] = {
+            0,1,1,2,2,3,3,0,
+            4,5,5,6,6,7,7,4,
+            0,4,1,5,2,6,3,7
+        };
+
+        f32 aspect_ratio = (f32)window_width / (f32)window_height;
+
+        XMMATRIX camera0_transform = XMMatrixRotationRollPitchYaw(cameras[0].pitch, cameras[0].yaw, 0.0f) * XMMatrixTranslationFromVector(cameras[0].position);
+        XMMATRIX view_matrix = XMMatrixInverse(0, camera0_transform);
+        XMMATRIX proj_matrix = XMMatrixPerspectiveFovRH(cameras[0].fov / aspect_ratio, aspect_ratio, cameras[0].near_plane, cameras[0].far_plane);
+        XMMATRIX view_proj_matrix = view_matrix * proj_matrix;
+        XMMATRIX inv_view_proj_matrix = XMMatrixInverse(0, view_proj_matrix);
+
+        for (int i = 0; i < ARRAY_LEN(frustum_vertices); ++i) {
+            frustum_vertices[i] = XMVector4Transform(frustum_vertices[i], inv_view_proj_matrix);
+            frustum_vertices[i] /= XMVectorGetW(frustum_vertices[i]);
+        }
+
+        RendererFrameData frame = {};
+        frame.camera = &renderer_camera;
+        frame.queue = queue;
+        frame.queue_len = queue_len;
+        frame.num_line_indices = ARRAY_LEN(line_indices);
+        frame.num_line_vertices = ARRAY_LEN(frustum_vertices);
+        frame.line_vertices = (XMFLOAT4*)frustum_vertices;
+        frame.line_indices = line_indices;
+
+        renderer_render_frame(renderer, &frame);
     }
 
     #if _DEBUG
