@@ -7,6 +7,8 @@
 #include "gltf.h"
 #include "utility/json.h"
 
+#define IGNORE_MATERIALS 0
+
 struct GLTFBuffer {
     u64 len;
     void* memory;
@@ -177,6 +179,7 @@ internal XMVECTOR extract_json_vector(Json* j) {
 
 internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererUploadContext* upload_context, char* dir, Json* root, GLTFBuffer* buffers, u32 num_buffers) {
     UNUSED(num_buffers);
+    UNUSED(dir);
 
     Scratch scratch = get_scratch(&arena, 1);
 
@@ -242,6 +245,11 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
         }
     }
 
+    Material* materials = 0;
+    int num_materials = 0;
+
+#if !IGNORE_MATERIALS
+
     GLTFImage* images = 0;
     int num_images = 0;
 
@@ -300,9 +308,6 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
 
     // Materials will be stored in the output arena because they are returned
 
-    Material* materials = 0;
-    int num_materials = 0;
-
     Json* asset_materials = json_query(root, "materials");
     if (asset_materials) {
         materials = arena_push_array_zero(arena, Material, json_len(asset_materials));
@@ -315,6 +320,12 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
             materials[num_materials++] = renderer_new_material(renderer, upload_context, image->width, image->height, image->memory);
         }
     }
+
+    for (int i = 0; i < num_images; ++i) {
+        stbi_image_free(images[i].memory);
+    }
+
+#endif // IF NOT IGNORE_MATERIALS
 
     Json* asset_meshes = json_query(root, "meshes");
     GLTFMesh* meshes = arena_push_array(scratch.arena, GLTFMesh, json_len(asset_meshes));
@@ -391,13 +402,17 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
             GLTFPrimitive* prim = &mesh->primitives[primitive_index++];
             prim->mesh = renderer_new_mesh(renderer, upload_context, vertex_data, vertex_count, index_data, index_count);
 
-            if (Json* material = json_query(primitive, "material")) {
-                assert(material->integer < num_materials);
-                prim->material = materials[material->integer];
-            }
-            else {
+            #if IGNORE_MATERIALS
                 prim->material = renderer_get_default_material(renderer);
-            }
+            #else
+                if (Json* material = json_query(primitive, "material")) {
+                    assert(material->integer < num_materials);
+                    prim->material = materials[material->integer];
+                }
+                else {
+                    prim->material = renderer_get_default_material(renderer);
+                }
+            #endif
 
             release_scratch(prim_scratch);
         }
@@ -472,10 +487,6 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
         else {
             node->mesh = 0;
         }
-    }
-
-    for (int i = 0; i < num_images; ++i) {
-        stbi_image_free(images[i].memory);
     }
 
     LoadGLTFResult result;

@@ -121,7 +121,8 @@ struct WindowEvents {
     f32 mouse_dy;
     b32 key_down[256];
     b32 key_up[256];
-};
+    f32 mouse_wheel_delta;
+}; 
 
 internal LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM w_param, LPARAM l_param) {
     LRESULT result = 0;
@@ -178,6 +179,11 @@ internal LRESULT CALLBACK window_callback(HWND window, UINT msg, WPARAM w_param,
         case WM_KEYUP:
             events->key_up[w_param] = true;
             break;
+
+        case WM_MOUSEWHEEL: {
+            i16 delta = (WORD)((w_param >> 16) & UINT16_MAX);
+            events->mouse_wheel_delta = (f32)delta / (f32)WHEEL_DELTA;
+        } break;
 
         default:
             result = DefWindowProcA(window, msg, w_param, l_param);
@@ -261,6 +267,8 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     XMVECTOR camera_velocity = {};
     f32 camera_yaw = 0.0f;
     f32 camera_pitch = 0.0f;
+    f32 target_camera_fov = PI32 * 0.5f;
+    f32 camera_fov = PI32 * 0.5f;
 
     while (true) {
         arena_clear(&frame_arena);
@@ -289,6 +297,8 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
             renderer_handle_resize(renderer, window_width, window_height);
         }
+
+        camera_fov += (target_camera_fov - camera_fov) * dt * 10.0f;
 
         if (in_camera) {
             f32 look_sensitivity = 0.001f;
@@ -344,6 +354,16 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             camera_velocity += camera_acceleration * dt;
             camera_position += camera_velocity * dt;
 
+            target_camera_fov -= events.mouse_wheel_delta * (PI32 / 12);
+
+            if (target_camera_fov > PI32*0.9f) {
+                target_camera_fov = PI32*0.9f;
+            }
+
+            if (target_camera_fov < PI32/6.0f) {
+                target_camera_fov = PI32/6.0f;
+            }
+
             if (events.key_up[VK_ESCAPE] || events.focused) {
                 ShowCursor(true);
                 ClipCursor(0);
@@ -369,7 +389,7 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
         Camera camera;
         camera.transform = camera_rotation_matrix * camera_translation_matrix;
-        camera.fov = PI32 * 0.5f;
+        camera.fov = camera_fov;
 
         MeshInstance* queue = 0;
         int queue_len = 0;
