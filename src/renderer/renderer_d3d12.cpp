@@ -17,7 +17,7 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define BINDLESS_HEAP_CAPACITY 1000000
 
 #define CONSTANT_BUFFER_SIZE 256
-#define CONSTANT_BUFFER_POOL_SIZE 256
+#define CONSTANT_BUFFER_POOL_SIZE 1024
 
 #define MAX_MESHES (8 * 1024)
 #define MAX_MATERIALS (8 * 1024)
@@ -158,7 +158,7 @@ struct IndirectCommand {
     u32 vbuffer_index;
     u32 ibuffer_index;
     u32 transform_index;
-    u32 material_index;
+    u32 texture_index;
     D3D12_DRAW_ARGUMENTS draw_arguments;
 };
 
@@ -369,7 +369,7 @@ internal CommandList* open_command_list(Renderer* r, D3D12_COMMAND_LIST_TYPE typ
         r->device->CreateCommandList(0, type, found->allocator, 0, IID_PPV_ARGS(&found->list));
         found->list->Close();
 
-        debug_message("Allocated a command list.\n");
+        debug_message("Created a command list.\n");
     }
 
     CommandList* cmd = found;
@@ -856,13 +856,11 @@ void renderer_handle_resize(Renderer* r, u32 width, u32 height) {
     r->depth_buffer->Release();
     create_depth_buffer(r, width, height);
 
-    debug_message("Resized swapchain (%d x %d)\n", width, height);
+    debug_message("Resized swapchain (%d x %d).\n", width, height);
 }
 
 internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_size) {
     if (!r->available_constant_buffers) {
-        debug_message("Creating a constant buffer pool (%d constant buffers)\n", CONSTANT_BUFFER_POOL_SIZE);
-
         D3D12_RESOURCE_DESC resource_desc = {};
         resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         resource_desc.Width = CONSTANT_BUFFER_SIZE * CONSTANT_BUFFER_POOL_SIZE;
@@ -903,6 +901,8 @@ internal ConstantBuffer* get_constant_buffer(Renderer* r, void* data, u64 data_s
 
             r->available_constant_buffers = buf;
         }
+
+        debug_message("Created a constant buffer pool (%d constant buffers).\n", CONSTANT_BUFFER_POOL_SIZE);
     }
 
     ConstantBuffer* buf = r->available_constant_buffers;
@@ -1100,7 +1100,7 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         indirect_command->vbuffer_index = mesh_data->vbuffer_view.index;
         indirect_command->ibuffer_index = mesh_data->ibuffer_view.index;
         indirect_command->transform_index = transform_cbuffer->cbv.index;
-        indirect_command->material_index = mat_data->texture_view.index;
+        indirect_command->texture_index = mat_data->texture_view.index;
         indirect_command->draw_arguments.VertexCountPerInstance = mesh_data->index_count;
         indirect_command->draw_arguments.InstanceCount = 1;
 

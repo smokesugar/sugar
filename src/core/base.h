@@ -43,4 +43,4 @@ void* arena_push_zero(Arena* arena, u64 size);
 #define arena_push_struct(arena, type) arena_push_array(arena, type, 1)
 #define arena_push_struct_zero(arena, type) arena_push_array_zero(arena, type, 1)
 
-#define arena_mark(arena, type) (type*)(arena->cursor)
+#define arena_mark(arena, type) ( assert(sizeof(type)%8==0), (type*)(arena->cursor) )
