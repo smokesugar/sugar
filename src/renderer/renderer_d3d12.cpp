@@ -25,6 +25,8 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define WRITABLE_MESH_VBUFFER_SIZE 1024
 #define WRITABLE_MESH_IBUFFER_SIZE 1024
 
+#define ARGUMENT_BUFFER_SIZE (1024 * 1024)
+
 struct Descriptor {
     #if _DEBUG
         u32 meta;
@@ -152,6 +154,20 @@ struct WritableMesh {
     Descriptor ibuffer_view;
 };
 
+struct IndirectCommand {
+    u32 vbuffer_index;
+    u32 ibuffer_index;
+    u32 transform_index;
+    u32 material_index;
+    D3D12_DRAW_ARGUMENTS draw_arguments;
+};
+
+struct ArgumentBuffer {
+    ArgumentBuffer* next;
+    ID3D12Resource* resource;
+    void* ptr;
+};
+
 struct CommandList {
     CommandList* next;
     u64 fence_val;
@@ -161,6 +177,7 @@ struct CommandList {
     ID3D12GraphicsCommandList* list;
     ConstantBuffer* constant_buffers;
     WritableMesh* writable_meshes;
+    ArgumentBuffer* argument_buffers;
 };
 
 struct ReleasableResource {
@@ -253,6 +270,7 @@ struct Renderer {
 
     ConstantBuffer* available_constant_buffers;
     WritableMesh* available_writable_meshes;
+    ArgumentBuffer* available_argument_buffers;
 
     CommandList* available_command_lists;
     CommandList* executing_command_lists;
@@ -263,6 +281,8 @@ struct Renderer {
 
     ID3D12PipelineState* lighting_pipeline;
     ID3D12PipelineState* line_pipeline;
+
+    ID3D12CommandSignature* command_signature;
 
     ID3D12Resource* depth_buffer;
     Descriptor depth_view;
@@ -279,7 +299,7 @@ internal void update_available_command_lists(Renderer* r) {
         CommandList* cmd = *p_cmd;
         if (command_queue_reached(cmd->queue, cmd->fence_val))
         {
-            // Add all constant buffers back into available pool
+            // Add all in-flight resources back into available pool
 
             if (cmd->constant_buffers) {
                 ConstantBuffer* n = cmd->constant_buffers;
@@ -299,6 +319,16 @@ internal void update_available_command_lists(Renderer* r) {
                 n->next = r->available_writable_meshes;
                 r->available_writable_meshes = cmd->writable_meshes;
                 cmd->writable_meshes = 0;
+            }
+
+            if (cmd->argument_buffers) {
+                ArgumentBuffer* n = cmd->argument_buffers;
+                while (n->next) {
+                    n = n->next;
+                }
+                n->next = r->available_argument_buffers;
+                r->available_argument_buffers = cmd->argument_buffers;
+                cmd->argument_buffers = 0;
             }
 
             // Add command list into available list
@@ -719,6 +749,19 @@ Renderer* renderer_init(Arena* arena, void* window) {
     line_vs->Release();
     line_ps->Release();
 
+    D3D12_INDIRECT_ARGUMENT_DESC indirect_arguments_descs[2] = {};
+    indirect_arguments_descs[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    indirect_arguments_descs[0].Constant.DestOffsetIn32BitValues = 1;
+    indirect_arguments_descs[0].Constant.Num32BitValuesToSet = 4;
+    indirect_arguments_descs[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+
+    D3D12_COMMAND_SIGNATURE_DESC command_signature_desc = {};
+    command_signature_desc.ByteStride = 4 * sizeof(u32) + sizeof(D3D12_DRAW_ARGUMENTS);
+    command_signature_desc.NumArgumentDescs = ARRAY_LEN(indirect_arguments_descs);
+    command_signature_desc.pArgumentDescs = indirect_arguments_descs;
+
+    r->device->CreateCommandSignature(&command_signature_desc, r->root_signature, IID_PPV_ARGS(&r->command_signature));
+
     r->depth_view = alloc_descriptor(&r->dsv_heap);
     create_depth_buffer(r, swapchain_desc.Width, swapchain_desc.Height);
 
@@ -762,8 +805,14 @@ void renderer_release_backend(Renderer* r) {
 
     r->depth_buffer->Release();
 
+    r->command_signature->Release();
+
     r->line_pipeline->Release();
     r->lighting_pipeline->Release();
+
+    for (ArgumentBuffer* n = r->available_argument_buffers; n; n = n->next) {
+        n->resource->Release();
+    }
 
     #if _DEBUG
     for (ReleasableResource* n = r->garbage; n; n = n->next) {
@@ -915,8 +964,10 @@ internal WritableMesh* get_writable_mesh(Renderer* r, XMFLOAT4* vertex_data, u32
         srv_desc.Buffer.StructureByteStride = sizeof(u32);
         r->device->CreateShaderResourceView(ibuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, writable_mesh->ibuffer_view));
 
+        #if _DEBUG
         append_releasable_resource(r, vbuffer, &r->garbage);
         append_releasable_resource(r, ibuffer, &r->garbage);
+        #endif
 
         vbuffer->Map(0, 0, &writable_mesh->vbuffer_ptr);
         ibuffer->Map(0, 0, &writable_mesh->ibuffer_ptr);
@@ -941,7 +992,49 @@ internal void drop_writable_mesh(CommandList* cmd, WritableMesh* writable_mesh) 
     cmd->writable_meshes = writable_mesh;
 }
 
+internal ArgumentBuffer* get_argument_buffer(Renderer* r, IndirectCommand* indirect_commands, u32 num_commands) {
+    ArgumentBuffer* buf;
+
+    if (r->available_argument_buffers) {
+        buf = r->available_argument_buffers;
+        r->available_argument_buffers = r->available_argument_buffers->next;
+    }
+    else {
+        buf = arena_push_struct_zero(&r->arena, ArgumentBuffer);
+
+        D3D12_RESOURCE_DESC resource_desc = {};
+        resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        resource_desc.Width = ARGUMENT_BUFFER_SIZE;
+        resource_desc.Height = 1;
+        resource_desc.DepthOrArraySize = 1;
+        resource_desc.MipLevels = 1;
+        resource_desc.SampleDesc.Count = 1;
+        resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&buf->resource));
+        buf->resource->Map(0, 0, &buf->ptr);
+
+        debug_message("Created an argument buffer.\n");
+    }
+
+    u64 commands_size = num_commands * sizeof(IndirectCommand);
+    assert(commands_size < ARGUMENT_BUFFER_SIZE);
+    memcpy(buf->ptr, indirect_commands, commands_size);
+
+    return buf;
+}
+
+internal void drop_argument_buffer(CommandList* cmd, ArgumentBuffer* buf) {
+    buf->next = cmd->argument_buffers;
+    cmd->argument_buffers = buf;
+}
+
 void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
+    Scratch scratch = get_scratch(0, 0);
+
     DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
     r->swapchain->GetDesc1(&swapchain_desc);
 
@@ -984,11 +1077,14 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
 
     f32 aspect_ratio = (f32)swapchain_desc.Width / (f32)swapchain_desc.Height;
     XMMATRIX view_matrix = XMMatrixInverse(0, frame->camera->transform);
-    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(frame->camera->fov/aspect_ratio, aspect_ratio, frame->camera->far_plane, frame->camera->near_plane);
+    XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(frame->camera->fov / aspect_ratio, aspect_ratio, frame->camera->far_plane, frame->camera->near_plane);
     XMMATRIX view_projection = view_matrix * projection_matrix;
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
     drop_constant_buffer(cmd, camera_cbuffer);
     cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
+
+    IndirectCommand* indirect_commands = arena_mark(scratch.arena, IndirectCommand);
+    u32 num_commands = 0;
 
     for (u32 i = 0; i < frame->queue_len; ++i) {
         MeshInstance* instance = &frame->queue[i];
@@ -999,12 +1095,22 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &instance->transform, sizeof(instance->transform));
         drop_constant_buffer(cmd, transform_cbuffer);
 
-        cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->vbuffer_view.index, 1);
-        cmd->list->SetGraphicsRoot32BitConstant(0, mesh_data->ibuffer_view.index, 2);
-        cmd->list->SetGraphicsRoot32BitConstant(0, transform_cbuffer->cbv.index, 3);
-        cmd->list->SetGraphicsRoot32BitConstant(0, mat_data->texture_view.index, 4);
+        IndirectCommand* indirect_command = arena_push_struct_zero(scratch.arena, IndirectCommand);
 
-        cmd->list->DrawInstanced(mesh_data->index_count, 1, 0, 0);
+        indirect_command->vbuffer_index = mesh_data->vbuffer_view.index;
+        indirect_command->ibuffer_index = mesh_data->ibuffer_view.index;
+        indirect_command->transform_index = transform_cbuffer->cbv.index;
+        indirect_command->material_index = mat_data->texture_view.index;
+        indirect_command->draw_arguments.VertexCountPerInstance = mesh_data->index_count;
+        indirect_command->draw_arguments.InstanceCount = 1;
+
+        ++num_commands;
+    }
+
+    if (num_commands > 0) {
+        ArgumentBuffer* argument_buffer = get_argument_buffer(r, indirect_commands, num_commands);
+        drop_argument_buffer(cmd, argument_buffer);
+        cmd->list->ExecuteIndirect(r->command_signature, num_commands, argument_buffer->resource, 0, 0, 0);
     }
 
     if (frame->num_line_indices > 0) {
@@ -1027,6 +1133,8 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
 
     r->swapchain->Present(1, 0);
     r->swapchain_fences[swapchain_index] = command_queue_signal(&r->direct_queue);
+
+    release_scratch(scratch);
 }
 
 Material renderer_get_default_material(Renderer* r) {

@@ -426,46 +426,49 @@ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             queue_len = gltf.num_instances;
         }
 
-        XMVECTOR frustum_vertices[] = {
-            { -1.0f,  1.0f, 0.0f, 1.0f },
-            {  1.0f,  1.0f, 0.0f, 1.0f },
-            {  1.0f, -1.0f, 0.0f, 1.0f },
-            { -1.0f, -1.0f, 0.0f, 1.0f },
-
-            { -1.0f,  1.0f, 1.0f, 1.0f },
-            {  1.0f,  1.0f, 1.0f, 1.0f },
-            {  1.0f, -1.0f, 1.0f, 1.0f },
-            { -1.0f, -1.0f, 1.0f, 1.0f },
-
-        };
-
-        u32 line_indices[] = {
-            0,1,1,2,2,3,3,0,
-            4,5,5,6,6,7,7,4,
-            0,4,1,5,2,6,3,7
-        };
-
-        f32 aspect_ratio = (f32)window_width / (f32)window_height;
-
-        XMMATRIX camera0_transform = XMMatrixRotationRollPitchYaw(cameras[0].pitch, cameras[0].yaw, 0.0f) * XMMatrixTranslationFromVector(cameras[0].position);
-        XMMATRIX view_matrix = XMMatrixInverse(0, camera0_transform);
-        XMMATRIX proj_matrix = XMMatrixPerspectiveFovRH(cameras[0].fov / aspect_ratio, aspect_ratio, cameras[0].near_plane, cameras[0].far_plane);
-        XMMATRIX view_proj_matrix = view_matrix * proj_matrix;
-        XMMATRIX inv_view_proj_matrix = XMMatrixInverse(0, view_proj_matrix);
-
-        for (int i = 0; i < ARRAY_LEN(frustum_vertices); ++i) {
-            frustum_vertices[i] = XMVector4Transform(frustum_vertices[i], inv_view_proj_matrix);
-            frustum_vertices[i] /= XMVectorGetW(frustum_vertices[i]);
-        }
-
         RendererFrameData frame = {};
         frame.camera = &renderer_camera;
         frame.queue = queue;
         frame.queue_len = queue_len;
-        frame.num_line_indices = ARRAY_LEN(line_indices);
-        frame.num_line_vertices = ARRAY_LEN(frustum_vertices);
-        frame.line_vertices = (XMFLOAT4*)frustum_vertices;
-        frame.line_indices = line_indices;
+
+        if (camera_index != 0) {
+            XMVECTOR frustum_vertices[] = {
+                { -1.0f,  1.0f, 0.0f, 1.0f },
+                {  1.0f,  1.0f, 0.0f, 1.0f },
+                {  1.0f, -1.0f, 0.0f, 1.0f },
+                { -1.0f, -1.0f, 0.0f, 1.0f },
+
+                { -1.0f,  1.0f, 1.0f, 1.0f },
+                {  1.0f,  1.0f, 1.0f, 1.0f },
+                {  1.0f, -1.0f, 1.0f, 1.0f },
+                { -1.0f, -1.0f, 1.0f, 1.0f },
+
+            };
+
+            u32 line_indices[] = {
+                0,1,1,2,2,3,3,0,
+                4,5,5,6,6,7,7,4,
+                0,4,1,5,2,6,3,7
+            };
+
+            f32 aspect_ratio = (f32)window_width / (f32)window_height;
+
+            XMMATRIX camera0_transform = XMMatrixRotationRollPitchYaw(cameras[0].pitch, cameras[0].yaw, 0.0f) * XMMatrixTranslationFromVector(cameras[0].position);
+            XMMATRIX view_matrix = XMMatrixInverse(0, camera0_transform);
+            XMMATRIX proj_matrix = XMMatrixPerspectiveFovRH(cameras[0].fov / aspect_ratio, aspect_ratio, cameras[0].near_plane, cameras[0].far_plane);
+            XMMATRIX view_proj_matrix = view_matrix * proj_matrix;
+            XMMATRIX inv_view_proj_matrix = XMMatrixInverse(0, view_proj_matrix);
+
+            for (int i = 0; i < ARRAY_LEN(frustum_vertices); ++i) {
+                frustum_vertices[i] = XMVector4Transform(frustum_vertices[i], inv_view_proj_matrix);
+                frustum_vertices[i] /= XMVectorGetW(frustum_vertices[i]);
+            }
+
+            frame.num_line_indices = ARRAY_LEN(line_indices);
+            frame.num_line_vertices = ARRAY_LEN(frustum_vertices);
+            frame.line_vertices = (XMFLOAT4*)frustum_vertices;
+            frame.line_indices = line_indices;
+        }
 
         renderer_render_frame(renderer, &frame);
     }
