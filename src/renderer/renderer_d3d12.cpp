@@ -17,10 +17,12 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define BINDLESS_HEAP_CAPACITY 1000000
 
 #define CONSTANT_BUFFER_SIZE 256
-#define CONSTANT_BUFFER_POOL_SIZE 1024
+#define CONSTANT_BUFFER_POOL_SIZE 2048
 
 #define MAX_MESHES (8 * 1024)
 #define MAX_MATERIALS (8 * 1024)
+
+#define UPLOAD_POOL_CAPACITY (32 * 1024 * 1024)
 
 #define WRITABLE_MESH_VBUFFER_SIZE 1024
 #define WRITABLE_MESH_IBUFFER_SIZE 1024
@@ -162,10 +164,29 @@ struct IndirectCommand {
     D3D12_DRAW_ARGUMENTS draw_arguments;
 };
 
-struct ArgumentBuffer {
-    ArgumentBuffer* next;
+struct WritableArgumentBuffer {
+    WritableArgumentBuffer* next;
     ID3D12Resource* resource;
     void* ptr;
+    Descriptor srv;
+};
+
+struct ReleasableResource {
+    ReleasableResource* next;
+    ID3D12Resource* resource;
+};
+
+struct UploadPool {
+    UploadPool* next;
+    ID3D12Resource* resource;
+    void* ptr;
+    u64 cursor;
+};
+
+struct UploadChunk {
+    ID3D12Resource* resource;
+    u64 offset;
+    u64 size;
 };
 
 struct CommandList {
@@ -175,14 +196,11 @@ struct CommandList {
     CommandQueue* queue;
     ID3D12CommandAllocator* allocator;
     ID3D12GraphicsCommandList* list;
+    UploadPool* upload_pools;
     ConstantBuffer* constant_buffers;
     WritableMesh* writable_meshes;
-    ArgumentBuffer* argument_buffers;
-};
-
-struct ReleasableResource {
-    ReleasableResource* next;
-    ID3D12Resource* resource;
+    WritableArgumentBuffer* writable_argument_buffers;
+    ReleasableResource* releasable_resources;
 };
 
 struct MeshData {
@@ -200,12 +218,10 @@ struct MaterialData {
 
 struct RendererUploadContext {
     CommandList* cmd;
-    ReleasableResource* releasable_resources;
 };
 
 struct RendererUploadTicket {
     u64 fence_val;
-    ReleasableResource* releasable_resources;
 };
 
 internal CommandQueue command_queue_init(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) {
@@ -270,7 +286,8 @@ struct Renderer {
 
     ConstantBuffer* available_constant_buffers;
     WritableMesh* available_writable_meshes;
-    ArgumentBuffer* available_argument_buffers;
+    WritableArgumentBuffer* available_writable_argument_buffers;
+    UploadPool* available_upload_pools;
 
     CommandList* available_command_lists;
     CommandList* executing_command_lists;
@@ -279,6 +296,7 @@ struct Renderer {
     ReleasableResource* garbage;
     #endif
 
+    ID3D12PipelineState* culling_pipeline;
     ID3D12PipelineState* lighting_pipeline;
     ID3D12PipelineState* line_pipeline;
 
@@ -290,8 +308,37 @@ struct Renderer {
     ResourcePool* mesh_pool;
     ResourcePool* material_pool;
 
+    ID3D12Resource* gpu_argument_buffer;
+    ID3D12Resource* gpu_argument_count;
+    Descriptor gpu_argument_buffer_uav;
+    Descriptor gpu_argument_count_uav;
+
     Material default_material;
 };
+
+internal void append_releasable_resource(Renderer* r, ID3D12Resource* resource, ReleasableResource** target) {
+    ReleasableResource* rr;
+
+    if (!r->releasable_resource_slots) {
+        rr = arena_push_struct_zero(&r->arena, ReleasableResource);
+    }
+    else {
+        rr = r->releasable_resource_slots;
+        r->releasable_resource_slots = rr->next;
+    }
+
+    rr->resource = resource;
+    rr->next = *target;
+    *target = rr;
+}
+
+internal ReleasableResource* release_releasable_resource(Renderer* r, ReleasableResource* rr) {
+    ReleasableResource* next = rr->next;
+    rr->resource->Release();
+    rr->next = r->releasable_resource_slots;
+    r->releasable_resource_slots = rr;
+    return next;
+}
 
 internal void update_available_command_lists(Renderer* r) { 
     for (CommandList** p_cmd = &r->executing_command_lists; *p_cmd;)
@@ -299,7 +346,17 @@ internal void update_available_command_lists(Renderer* r) {
         CommandList* cmd = *p_cmd;
         if (command_queue_reached(cmd->queue, cmd->fence_val))
         {
-            // Add all in-flight resources back into available pool
+            // Add all in-flight resources back into available pools
+
+            for (UploadPool* pool = cmd->upload_pools; pool;) {
+                pool->cursor = 0;
+                UploadPool* next = pool->next;
+                pool->next = r->available_upload_pools;
+                r->available_upload_pools = pool;
+                pool = next;
+            }
+
+            cmd->upload_pools = 0;
 
             if (cmd->constant_buffers) {
                 ConstantBuffer* n = cmd->constant_buffers;
@@ -321,15 +378,21 @@ internal void update_available_command_lists(Renderer* r) {
                 cmd->writable_meshes = 0;
             }
 
-            if (cmd->argument_buffers) {
-                ArgumentBuffer* n = cmd->argument_buffers;
+            if (cmd->writable_argument_buffers) {
+                WritableArgumentBuffer* n = cmd->writable_argument_buffers;
                 while (n->next) {
                     n = n->next;
                 }
-                n->next = r->available_argument_buffers;
-                r->available_argument_buffers = cmd->argument_buffers;
-                cmd->argument_buffers = 0;
+                n->next = r->available_writable_argument_buffers;
+                r->available_writable_argument_buffers = cmd->writable_argument_buffers;
+                cmd->writable_argument_buffers = 0;
             }
+
+            for (ReleasableResource* rr = cmd->releasable_resources; rr;) {
+                rr = release_releasable_resource(r, rr);
+            }
+        
+            cmd->releasable_resources = 0;
 
             // Add command list into available list
 
@@ -379,6 +442,7 @@ internal CommandList* open_command_list(Renderer* r, D3D12_COMMAND_LIST_TYPE typ
 
     if (cmd->type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         cmd->list->SetGraphicsRootSignature(r->root_signature);
+        cmd->list->SetComputeRootSignature(r->root_signature);
         cmd->list->SetDescriptorHeaps(1, &r->bindless_heap.heap);
     }
 
@@ -515,52 +579,117 @@ internal void create_depth_buffer(Renderer* r, u32 width, u32 height) {
     r->device->CreateDepthStencilView(r->depth_buffer, &dsv_desc, cpu_descriptor_handle(&r->dsv_heap, r->depth_view));
 }
 
-internal ID3D12Resource* create_staging_buffer(ID3D12Device* device, void* data, u32 size) {
-    // TODO: pool these allocations - don't want to make a resource for every upload
+internal UploadPool* get_upload_pool(Renderer* r) {
+    if (!r->available_upload_pools) {
+        UploadPool* pool = arena_push_struct_zero(&r->arena, UploadPool);
 
-    D3D12_RESOURCE_DESC resource_desc = {};
-    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    resource_desc.Width = size;
-    resource_desc.Height = 1;
-    resource_desc.DepthOrArraySize = 1;
-    resource_desc.MipLevels = 1;
-    resource_desc.SampleDesc.Count = 1;
-    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RESOURCE_DESC buffer_desc = {};
+        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer_desc.Width = UPLOAD_POOL_CAPACITY;
+        buffer_desc.Height = 1;
+        buffer_desc.DepthOrArraySize = 1;
+        buffer_desc.MipLevels = 1;
+        buffer_desc.SampleDesc.Count = 1;
+        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    D3D12_HEAP_PROPERTIES heap_props = {};
-    heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
 
-    ID3D12Resource* buf;
-    device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&buf));
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&pool->resource));
 
-    void* mapped_ptr;
-    buf->Map(0, 0, &mapped_ptr);
-    memcpy(mapped_ptr, data, size);
-    buf->Unmap(0, 0);
+        #if _DEBUG
+        append_releasable_resource(r, pool->resource, &r->garbage);
+        #endif
 
-    return buf;
-}
+        pool->resource->Map(0, 0, &pool->ptr);
 
-internal void append_releasable_resource(Renderer* r, ID3D12Resource* resource, ReleasableResource** target) {
-    ReleasableResource* rr;
+        debug_message("Created an upload pool.\n");
 
-    if (!r->releasable_resource_slots) {
-        rr = arena_push_struct_zero(&r->arena, ReleasableResource);
+        return pool;
     }
     else {
-        rr = r->releasable_resource_slots;
-        r->releasable_resource_slots = rr->next;
+        UploadPool* pool = r->available_upload_pools;
+        r->available_upload_pools = r->available_upload_pools->next;
+        return pool;
     }
-
-    rr->resource = resource;
-    rr->next = *target;
-    *target = rr;
 }
 
-internal void release_releasable_resource(Renderer* r, ReleasableResource* rr) {
-    rr->resource->Release();
-    rr->next = r->releasable_resource_slots;
-    r->releasable_resource_slots = rr;
+internal UploadChunk get_upload_chunk(Renderer* r, CommandList* cmd, void* data, u32 size) {
+    // TODO: pool these allocations - don't want to make a resource for every upload
+
+    if (size <= UPLOAD_POOL_CAPACITY) {        
+        UploadPool* chosen_pool = 0;
+
+        for (UploadPool* p = cmd->upload_pools; p; p = p->next) {
+            u64 available_capacity = UPLOAD_POOL_CAPACITY - p->cursor;
+            if (available_capacity >= size) {
+                chosen_pool = p;
+                break;
+            }
+        }
+
+        if (!chosen_pool) {
+            chosen_pool = get_upload_pool(r);
+            chosen_pool->next = cmd->upload_pools;
+            cmd->upload_pools = chosen_pool;
+        }
+
+        UploadChunk chunk = {};
+        chunk.resource = chosen_pool->resource;
+        chunk.offset = chosen_pool->cursor;
+        chosen_pool->cursor += size;
+        chunk.size = size;
+
+        memcpy((u8*)chosen_pool->ptr + chunk.offset, data, size);
+
+        return chunk;
+    }
+    else {
+        D3D12_RESOURCE_DESC buffer_desc = {};
+        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer_desc.Width = size;
+        buffer_desc.Height = 1;
+        buffer_desc.DepthOrArraySize = 1;
+        buffer_desc.MipLevels = 1;
+        buffer_desc.SampleDesc.Count = 1;
+        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heap_props = {};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        ID3D12Resource* resource;
+        r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&resource));
+        append_releasable_resource(r, resource, &cmd->releasable_resources);
+
+        debug_message("Upload too big to fit into upload pool; created dedicated staging buffer.\n");
+
+        void* ptr = 0;
+        resource->Map(0, 0, &ptr);
+        memcpy(ptr, data, size);
+
+        UploadChunk chunk = {};
+        chunk.resource = resource;
+        chunk.size = size;
+
+        return chunk;
+    }
+}
+
+internal void write_buffer(Renderer* r, CommandList* cmd, ID3D12Resource* dst, void* data, u32 size) {
+    D3D12_RESOURCE_DESC dst_desc = dst->GetDesc();
+    assert(size <= dst_desc.Width);
+    UploadChunk chunk = get_upload_chunk(r, cmd, data, size);
+    cmd->list->CopyBufferRegion(dst, 0, chunk.resource, chunk.offset, size);
+}
+
+inline D3D12_COMPUTE_PIPELINE_STATE_DESC fill_compute_pipeline_desc(Renderer* r, IDxcBlob* cs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC result = {};
+
+    result.pRootSignature = r->root_signature;
+    result.CS.BytecodeLength = cs->GetBufferSize();
+    result.CS.pShaderBytecode = cs->GetBufferPointer();
+
+    return result;
 }
 
 internal D3D12_GRAPHICS_PIPELINE_STATE_DESC fill_graphics_pipeline_desc(Renderer* r, IDxcBlob* vs, IDxcBlob* ps, DXGI_FORMAT depth_format) {
@@ -736,6 +865,10 @@ Renderer* renderer_init(Arena* arena, void* window) {
     IDxcBlob* lighting_ps = compile_shader("lighting.hlsl", "ps_main", "ps_6_6");
     IDxcBlob* line_vs = compile_shader("line.hlsl", "vs_main", "vs_6_6");
     IDxcBlob* line_ps = compile_shader("line.hlsl", "ps_main", "ps_6_6");
+    IDxcBlob* culling_cs = compile_shader("culling.hlsl", "cs_main", "cs_6_6");
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC culling_pipeline_desc = fill_compute_pipeline_desc(r, culling_cs);
+    r->device->CreateComputePipelineState(&culling_pipeline_desc, IID_PPV_ARGS(&r->culling_pipeline));
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lighting_pipeline_desc = fill_graphics_pipeline_desc(r, lighting_vs, lighting_ps, DXGI_FORMAT_D32_FLOAT);
     r->device->CreateGraphicsPipelineState(&lighting_pipeline_desc, IID_PPV_ARGS(&r->lighting_pipeline));
@@ -748,6 +881,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     lighting_ps->Release();
     line_vs->Release();
     line_ps->Release();
+    culling_cs->Release();
 
     D3D12_INDIRECT_ARGUMENT_DESC indirect_arguments_descs[2] = {};
     indirect_arguments_descs[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
@@ -756,7 +890,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     indirect_arguments_descs[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
 
     D3D12_COMMAND_SIGNATURE_DESC command_signature_desc = {};
-    command_signature_desc.ByteStride = 4 * sizeof(u32) + sizeof(D3D12_DRAW_ARGUMENTS);
+    command_signature_desc.ByteStride = sizeof(IndirectCommand);
     command_signature_desc.NumArgumentDescs = ARRAY_LEN(indirect_arguments_descs);
     command_signature_desc.pArgumentDescs = indirect_arguments_descs;
 
@@ -769,6 +903,39 @@ Renderer* renderer_init(Arena* arena, void* window) {
     r->material_pool = resource_pool_new(arena, MAX_MATERIALS, sizeof(MaterialData));
 
     RendererUploadContext* upload_context = renderer_open_upload_context(scratch.arena, r);
+
+    D3D12_HEAP_PROPERTIES default_heap_props = {};
+    default_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC buffer_desc = {};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    buffer_desc.Width = ARGUMENT_BUFFER_SIZE;
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&r->gpu_argument_buffer));
+
+    buffer_desc.Width = sizeof(u32);
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    r->device->CreateCommittedResource(&default_heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&r->gpu_argument_count));
+
+    r->gpu_argument_buffer_uav = alloc_descriptor(&r->bindless_heap);
+    r->gpu_argument_count_uav = alloc_descriptor(&r->bindless_heap);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC buffer_uav_desc = {};
+    buffer_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+
+    buffer_uav_desc.Buffer.NumElements = ARGUMENT_BUFFER_SIZE / sizeof(IndirectCommand);
+    buffer_uav_desc.Buffer.StructureByteStride = sizeof(IndirectCommand);
+    r->device->CreateUnorderedAccessView(r->gpu_argument_buffer, 0, &buffer_uav_desc, cpu_descriptor_handle(&r->bindless_heap, r->gpu_argument_buffer_uav));
+
+    buffer_uav_desc.Buffer.NumElements = 1;
+    buffer_uav_desc.Buffer.StructureByteStride = sizeof(u32);
+    r->device->CreateUnorderedAccessView(r->gpu_argument_count, 0, &buffer_uav_desc, cpu_descriptor_handle(&r->bindless_heap, r->gpu_argument_count_uav));
 
     u8 default_texture_data[4] = { 128, 128, 128, 128 };
     r->default_material = renderer_new_material(r, upload_context, 1, 1, default_texture_data);
@@ -800,6 +967,9 @@ void renderer_release_backend(Renderer* r) {
 
     renderer_free_material(r, r->default_material);
 
+    r->gpu_argument_buffer->Release();
+    r->gpu_argument_count->Release();
+
     assert(resource_pool_num_allocations(r->mesh_pool) == 0 && "Outstanding meshes. Free all meshes in debug builds.");
     assert(resource_pool_num_allocations(r->material_pool) == 0 && "Outstanding materials. Free all materials in debug builds.");
 
@@ -809,8 +979,9 @@ void renderer_release_backend(Renderer* r) {
 
     r->line_pipeline->Release();
     r->lighting_pipeline->Release();
+    r->culling_pipeline->Release();
 
-    for (ArgumentBuffer* n = r->available_argument_buffers; n; n = n->next) {
+    for (WritableArgumentBuffer* n = r->available_writable_argument_buffers; n; n = n->next) {
         n->resource->Release();
     }
 
@@ -992,15 +1163,15 @@ internal void drop_writable_mesh(CommandList* cmd, WritableMesh* writable_mesh) 
     cmd->writable_meshes = writable_mesh;
 }
 
-internal ArgumentBuffer* get_argument_buffer(Renderer* r, IndirectCommand* indirect_commands, u32 num_commands) {
-    ArgumentBuffer* buf;
+internal WritableArgumentBuffer* get_writable_argument_buffer(Renderer* r, IndirectCommand* indirect_commands, u32 num_commands) {
+    WritableArgumentBuffer* buf;
 
-    if (r->available_argument_buffers) {
-        buf = r->available_argument_buffers;
-        r->available_argument_buffers = r->available_argument_buffers->next;
+    if (r->available_writable_argument_buffers) {
+        buf = r->available_writable_argument_buffers;
+        r->available_writable_argument_buffers = r->available_writable_argument_buffers->next;
     }
     else {
-        buf = arena_push_struct_zero(&r->arena, ArgumentBuffer);
+        buf = arena_push_struct_zero(&r->arena, WritableArgumentBuffer);
 
         D3D12_RESOURCE_DESC resource_desc = {};
         resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1017,6 +1188,16 @@ internal ArgumentBuffer* get_argument_buffer(Renderer* r, IndirectCommand* indir
         r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, 0, IID_PPV_ARGS(&buf->resource));
         buf->resource->Map(0, 0, &buf->ptr);
 
+        buf->srv = alloc_descriptor(&r->bindless_heap);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Buffer.NumElements = ARGUMENT_BUFFER_SIZE/sizeof(IndirectCommand);
+        srv_desc.Buffer.StructureByteStride = sizeof(IndirectCommand);
+
+        r->device->CreateShaderResourceView(buf->resource, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, buf->srv));
+
         debug_message("Created an argument buffer.\n");
     }
 
@@ -1027,9 +1208,9 @@ internal ArgumentBuffer* get_argument_buffer(Renderer* r, IndirectCommand* indir
     return buf;
 }
 
-internal void drop_argument_buffer(CommandList* cmd, ArgumentBuffer* buf) {
-    buf->next = cmd->argument_buffers;
-    cmd->argument_buffers = buf;
+internal void drop_writable_argument_buffer(CommandList* cmd, WritableArgumentBuffer* buf) {
+    buf->next = cmd->writable_argument_buffers;
+    cmd->writable_argument_buffers = buf;
 }
 
 void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
@@ -1072,16 +1253,12 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
     cmd->list->RSSetScissorRects(1, &scissor);
     cmd->list->RSSetViewports(1, &viewport);
 
-    cmd->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cmd->list->SetPipelineState(r->lighting_pipeline);
-
     f32 aspect_ratio = (f32)swapchain_desc.Width / (f32)swapchain_desc.Height;
     XMMATRIX view_matrix = XMMatrixInverse(0, frame->camera->transform);
     XMMATRIX projection_matrix = XMMatrixPerspectiveFovRH(frame->camera->fov / aspect_ratio, aspect_ratio, frame->camera->far_plane, frame->camera->near_plane);
     XMMATRIX view_projection = view_matrix * projection_matrix;
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
     drop_constant_buffer(cmd, camera_cbuffer);
-    cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
 
     IndirectCommand* indirect_commands = arena_mark(scratch.arena, IndirectCommand);
     u32 num_commands = 0;
@@ -1108,9 +1285,36 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
     }
 
     if (num_commands > 0) {
-        ArgumentBuffer* argument_buffer = get_argument_buffer(r, indirect_commands, num_commands);
-        drop_argument_buffer(cmd, argument_buffer);
-        cmd->list->ExecuteIndirect(r->command_signature, num_commands, argument_buffer->resource, 0, 0, 0);
+        WritableArgumentBuffer* argument_buffer = get_writable_argument_buffer(r, indirect_commands, num_commands);
+        drop_writable_argument_buffer(cmd, argument_buffer);
+
+        u32 zero32 = 0;
+        write_buffer(r, cmd, r->gpu_argument_count, &zero32, sizeof(zero32));
+
+        cmd->list->SetPipelineState(r->culling_pipeline);
+        cmd->list->SetComputeRoot32BitConstant(0, argument_buffer->srv.index, 0);
+        cmd->list->SetComputeRoot32BitConstant(0, num_commands, 1);
+        cmd->list->SetComputeRoot32BitConstant(0, r->gpu_argument_buffer_uav.index, 2);
+        cmd->list->SetComputeRoot32BitConstant(0, r->gpu_argument_count_uav.index, 3);
+        cmd->list->Dispatch(num_commands / 256 + 1, 1, 1);
+
+        D3D12_RESOURCE_BARRIER barriers[3] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barriers[0].UAV.pResource = r->gpu_argument_buffer;
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barriers[1].UAV.pResource = r->gpu_argument_count;
+        barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[2].Transition.pResource = r->gpu_argument_count;
+        barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+        cmd->list->ResourceBarrier(ARRAY_LEN(barriers), barriers);
+
+        cmd->list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd->list->SetPipelineState(r->lighting_pipeline);
+        cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
+        cmd->list->ExecuteIndirect(r->command_signature, num_commands, r->gpu_argument_buffer, 0, r->gpu_argument_count, 0);
     }
 
     if (frame->num_line_indices > 0) {
@@ -1151,33 +1355,15 @@ RendererUploadTicket* renderer_submit_upload_context(Arena* arena, Renderer* r, 
     submit_command_list(r, &r->copy_queue, context->cmd);
     RendererUploadTicket* ticket = arena_push_struct(arena, RendererUploadTicket);
     ticket->fence_val = command_queue_signal(&r->copy_queue);
-    ticket->releasable_resources = context->releasable_resources;
     return ticket;
 }
 
-internal void clear_upload_ticket(Renderer* r, RendererUploadTicket* ticket) {
-    for (ReleasableResource* n = ticket->releasable_resources; n;) {
-        ReleasableResource* next = n->next;
-        release_releasable_resource(r, n);
-        n = next;
-    }
-
-    ticket->releasable_resources = 0;
-}
-
 bool renderer_upload_finished(Renderer* r, RendererUploadTicket* ticket) {
-    bool result = command_queue_reached(&r->copy_queue, ticket->fence_val);
-
-    if (result) {
-        clear_upload_ticket(r, ticket);
-    }
-
-    return result;
+    return command_queue_reached(&r->copy_queue, ticket->fence_val);
 }
 
 void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket) {
     command_queue_wait(&r->copy_queue, ticket->fence_val);
-    clear_upload_ticket(r, ticket);
 }
 
 Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
@@ -1205,11 +1391,8 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     resource_desc.Width = index_data_size;
     r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->ibuffer));
 
-    ID3D12Resource* staging_vbuffer = create_staging_buffer(r->device, vertex_data, vertex_data_size);
-    ID3D12Resource* staging_ibuffer = create_staging_buffer(r->device, index_data, index_data_size);
-
-    upload_context->cmd->list->CopyBufferRegion(data->vbuffer, 0, staging_vbuffer, 0, vertex_data_size);
-    upload_context->cmd->list->CopyBufferRegion(data->ibuffer, 0, staging_ibuffer, 0, index_data_size);
+    write_buffer(r, upload_context->cmd, data->vbuffer, vertex_data, vertex_data_size);
+    write_buffer(r, upload_context->cmd, data->ibuffer, index_data, index_data_size);
 
     data->vbuffer_view = alloc_descriptor(&r->bindless_heap);
     data->ibuffer_view = alloc_descriptor(&r->bindless_heap);
@@ -1227,9 +1410,6 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     r->device->CreateShaderResourceView(data->ibuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, data->ibuffer_view));
 
     data->index_count = index_count;
-
-    append_releasable_resource(r, staging_vbuffer, &upload_context->releasable_resources);
-    append_releasable_resource(r, staging_ibuffer, &upload_context->releasable_resources);
 
     Mesh mesh = {};
     mesh.handle = handle;
@@ -1273,23 +1453,23 @@ Material renderer_new_material(Renderer* r, RendererUploadContext* upload_contex
 
     r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, 0, IID_PPV_ARGS(&data->texture));
 
-    ID3D12Resource* staging_texture = create_staging_buffer(r->device, texture_data, texture_w * texture_h * sizeof(u32));
+    UploadChunk upload_chunk = get_upload_chunk(r, upload_context->cmd, texture_data, texture_w * texture_h * sizeof(u32));
     
     D3D12_TEXTURE_COPY_LOCATION dest_loc = {};
     dest_loc.pResource = data->texture;
     dest_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
     D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-    src_loc.pResource = staging_texture;
+    src_loc.pResource = upload_chunk.resource;
     src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src_loc.PlacedFootprint.Footprint.Format = texture_desc.Format;
+    src_loc.PlacedFootprint.Offset = upload_chunk.offset;
     src_loc.PlacedFootprint.Footprint.Width = texture_w;
     src_loc.PlacedFootprint.Footprint.Height = texture_h;
     src_loc.PlacedFootprint.Footprint.Depth = 1;
     src_loc.PlacedFootprint.Footprint.RowPitch = texture_w * sizeof(u32);
         
     upload_context->cmd->list->CopyTextureRegion(&dest_loc, 0, 0, 0, &src_loc, 0);
-    append_releasable_resource(r, staging_texture, &upload_context->releasable_resources);
 
     data->texture_view = alloc_descriptor(&r->bindless_heap);
 
