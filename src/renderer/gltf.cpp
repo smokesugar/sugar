@@ -7,7 +7,7 @@
 #include "gltf.h"
 #include "utility/json.h"
 
-#define IGNORE_MATERIALS 1
+#define IGNORE_MATERIALS 0
 
 struct GLTFBuffer {
     u64 len;
@@ -373,6 +373,9 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
             f32* norm_src = (f32*)((u8*)norm_accessor->view->buffer->memory + norm_accessor->view->offset + norm_accessor->offset);
             f32* uv_src = (f32*)((u8*)uv_accessor->view->buffer->memory + uv_accessor->view->offset + uv_accessor->offset);
             void* index_src = (u8*)indices_accessor->view->buffer->memory + indices_accessor->view->offset + indices_accessor->offset;
+            
+            XMVECTOR aabb_min =  XMVectorSplatInfinity();
+            XMVECTOR aabb_max = -XMVectorSplatInfinity();
 
             for (u32 i = 0; i < vertex_count; ++i) {
                 Vertex* v = &vertex_data[i];
@@ -384,6 +387,9 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
                 v->pos = { pos[0], pos[1], pos[2] };
                 v->norm = { norm[0], norm[1], norm[2] };
                 v->uv = { uv[0], uv[1] };
+
+                aabb_max = XMVectorMax(aabb_max, XMLoadFloat3(&v->pos));
+                aabb_min = XMVectorMin(aabb_min, XMLoadFloat3(&v->pos));
             }
 
             switch (indices_accessor->type) {
@@ -399,8 +405,16 @@ internal LoadGLTFResult process_gltf(Arena* arena, Renderer* renderer, RendererU
                     assert(false && "Unreachable");
             }
 
+            MeshCreateInfo mesh_info = {};
+            mesh_info.vertex_data = vertex_data;
+            mesh_info.index_data = index_data;
+            mesh_info.vertex_count = vertex_count;
+            mesh_info.index_count = index_count;
+            XMStoreFloat3(&mesh_info.aabb.min, aabb_min);
+            XMStoreFloat3(&mesh_info.aabb.max, aabb_max);
+
             GLTFPrimitive* prim = &mesh->primitives[primitive_index++];
-            prim->mesh = renderer_new_mesh(renderer, upload_context, vertex_data, vertex_count, index_data, index_count);
+            prim->mesh = renderer_new_mesh(renderer, upload_context, &mesh_info);
 
             #if IGNORE_MATERIALS
                 prim->material = renderer_get_default_material(renderer);

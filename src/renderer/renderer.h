@@ -33,16 +33,22 @@ struct RendererCamera {
     f32 fov;
 };
 
-struct RendererFrameData {
-    RendererCamera* camera;
-
-    MeshInstance* queue;
-    u32 queue_len;
-
+struct LineMesh {
     u32 num_line_vertices;
     u32 num_line_indices;
     XMFLOAT4* line_vertices;
     u32* line_indices;
+};
+
+struct RendererFrameData {
+    u32 queue_len;
+    u32 num_line_meshes;
+    RendererCamera* camera;
+
+    MeshInstance* queue;
+
+    LineMesh* line_meshes;
+    XMVECTOR frustum[6];
 };
 
 void renderer_render_frame(Renderer* r, RendererFrameData* frame);
@@ -63,7 +69,22 @@ struct Vertex {
     XMFLOAT2 uv;
 };
 
-Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count);
+struct AABB {
+    XMFLOAT3 min;
+    f32 pad0;
+    XMFLOAT3 max;
+    f32 pad1;
+};
+
+struct MeshCreateInfo {
+    Vertex* vertex_data;
+    u32* index_data;
+    u32 vertex_count;
+    u32 index_count;
+    AABB aabb;
+};
+
+Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, MeshCreateInfo* info);
 void renderer_free_mesh(Renderer* r, Mesh mesh);
 bool renderer_mesh_alive(Renderer* r, Mesh mesh);
 

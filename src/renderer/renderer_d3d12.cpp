@@ -22,7 +22,7 @@ extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = u8"./d3d12/";
 #define MAX_MESHES (8 * 1024)
 #define MAX_MATERIALS (8 * 1024)
 
-#define UPLOAD_POOL_CAPACITY (32 * 1024 * 1024)
+#define UPLOAD_POOL_CAPACITY (64 * 1024 * 1024)
 
 #define WRITABLE_MESH_VBUFFER_SIZE 1024
 #define WRITABLE_MESH_IBUFFER_SIZE 1024
@@ -161,6 +161,7 @@ struct IndirectCommand {
     u32 ibuffer_index;
     u32 transform_index;
     u32 texture_index;
+    u32 aabb_index;
     D3D12_DRAW_ARGUMENTS draw_arguments;
 };
 
@@ -208,6 +209,7 @@ struct MeshData {
     ID3D12Resource* ibuffer;
     Descriptor vbuffer_view;
     Descriptor ibuffer_view;
+    ConstantBuffer* aabb_cbuffer;
     u32 index_count;
 };
 
@@ -886,7 +888,7 @@ Renderer* renderer_init(Arena* arena, void* window) {
     D3D12_INDIRECT_ARGUMENT_DESC indirect_arguments_descs[2] = {};
     indirect_arguments_descs[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
     indirect_arguments_descs[0].Constant.DestOffsetIn32BitValues = 1;
-    indirect_arguments_descs[0].Constant.Num32BitValuesToSet = 4;
+    indirect_arguments_descs[0].Constant.Num32BitValuesToSet = 5;
     indirect_arguments_descs[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
 
     D3D12_COMMAND_SIGNATURE_DESC command_signature_desc = {};
@@ -1090,6 +1092,11 @@ internal void drop_constant_buffer(CommandList* cmd, ConstantBuffer* buf) {
     cmd->constant_buffers = buf;
 }
 
+internal void immediate_drop_constant_buffer(Renderer* r, ConstantBuffer* buf) {
+    buf->next = r->available_constant_buffers;
+    r->available_constant_buffers = buf;
+}
+
 internal WritableMesh* get_writable_mesh(Renderer* r, XMFLOAT4* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
     WritableMesh* writable_mesh;
 
@@ -1260,8 +1267,11 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
     ConstantBuffer* camera_cbuffer = get_constant_buffer(r, &view_projection, sizeof(view_projection));
     drop_constant_buffer(cmd, camera_cbuffer);
 
-    IndirectCommand* indirect_commands = arena_mark(scratch.arena, IndirectCommand);
-    u32 num_commands = 0;
+    ConstantBuffer* frustum_cbuffer = get_constant_buffer(r, frame->frustum, sizeof(frame->frustum));
+    drop_constant_buffer(cmd, frustum_cbuffer);
+
+    IndirectCommand* indirect_commands = arena_push_array(scratch.arena, IndirectCommand, frame->queue_len);
+    int num_commands = frame->queue_len;
 
     for (u32 i = 0; i < frame->queue_len; ++i) {
         MeshInstance* instance = &frame->queue[i];
@@ -1272,16 +1282,14 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         ConstantBuffer* transform_cbuffer = get_constant_buffer(r, &instance->transform, sizeof(instance->transform));
         drop_constant_buffer(cmd, transform_cbuffer);
 
-        IndirectCommand* indirect_command = arena_push_struct_zero(scratch.arena, IndirectCommand);
-
+        IndirectCommand* indirect_command = &indirect_commands[i];
         indirect_command->vbuffer_index = mesh_data->vbuffer_view.index;
         indirect_command->ibuffer_index = mesh_data->ibuffer_view.index;
         indirect_command->transform_index = transform_cbuffer->cbv.index;
         indirect_command->texture_index = mat_data->texture_view.index;
+        indirect_command->aabb_index = mesh_data->aabb_cbuffer->cbv.index;
         indirect_command->draw_arguments.VertexCountPerInstance = mesh_data->index_count;
         indirect_command->draw_arguments.InstanceCount = 1;
-
-        ++num_commands;
     }
 
     if (num_commands > 0) {
@@ -1296,6 +1304,7 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         cmd->list->SetComputeRoot32BitConstant(0, num_commands, 1);
         cmd->list->SetComputeRoot32BitConstant(0, r->gpu_argument_buffer_uav.index, 2);
         cmd->list->SetComputeRoot32BitConstant(0, r->gpu_argument_count_uav.index, 3);
+        cmd->list->SetComputeRoot32BitConstant(0, frustum_cbuffer->cbv.index, 4);
         cmd->list->Dispatch(num_commands / 256 + 1, 1, 1);
 
         D3D12_RESOURCE_BARRIER barriers[3] = {};
@@ -1317,8 +1326,10 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         cmd->list->ExecuteIndirect(r->command_signature, num_commands, r->gpu_argument_buffer, 0, r->gpu_argument_count, 0);
     }
 
-    if (frame->num_line_indices > 0) {
-        WritableMesh* writable_mesh = get_writable_mesh(r, frame->line_vertices, frame->num_line_vertices, frame->line_indices, frame->num_line_indices);
+    for (u32 i = 0; i < frame->num_line_meshes; ++i) {
+        LineMesh* data = &frame->line_meshes[i];
+
+        WritableMesh* writable_mesh = get_writable_mesh(r, data->line_vertices, data->num_line_vertices, data->line_indices, data->num_line_indices);
         drop_writable_mesh(cmd, writable_mesh);
 
         cmd->list->SetPipelineState(r->line_pipeline);
@@ -1326,7 +1337,7 @@ void renderer_render_frame(Renderer* r, RendererFrameData* frame) {
         cmd->list->SetGraphicsRoot32BitConstant(0, camera_cbuffer->cbv.index, 0);
         cmd->list->SetGraphicsRoot32BitConstant(0, writable_mesh->vbuffer_view.index, 1);
         cmd->list->SetGraphicsRoot32BitConstant(0, writable_mesh->ibuffer_view.index, 2);
-        cmd->list->DrawInstanced(frame->num_line_indices, 1, 0, 0);
+        cmd->list->DrawInstanced(data->num_line_indices, 1, 0, 0);
     }
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1366,11 +1377,11 @@ void renderer_flush_upload(Renderer* r, RendererUploadTicket* ticket) {
     command_queue_wait(&r->copy_queue, ticket->fence_val);
 }
 
-Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Vertex* vertex_data, u32 vertex_count, u32* index_data, u32 index_count) {
+Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, MeshCreateInfo* info) {
     u64 handle = resource_pool_alloc(r->mesh_pool);
 
-    u32 vertex_data_size = vertex_count * sizeof(Vertex);
-    u32 index_data_size = index_count * sizeof(u32);
+    u32 vertex_data_size = info->vertex_count * sizeof(Vertex);
+    u32 index_data_size = info->index_count * sizeof(u32);
 
     MeshData* data = resource_pool_access(r->mesh_pool, handle, MeshData);
 
@@ -1391,8 +1402,8 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     resource_desc.Width = index_data_size;
     r->device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &resource_desc, D3D12_RESOURCE_STATE_COMMON, 0, IID_PPV_ARGS(&data->ibuffer));
 
-    write_buffer(r, upload_context->cmd, data->vbuffer, vertex_data, vertex_data_size);
-    write_buffer(r, upload_context->cmd, data->ibuffer, index_data, index_data_size);
+    write_buffer(r, upload_context->cmd, data->vbuffer, info->vertex_data, vertex_data_size);
+    write_buffer(r, upload_context->cmd, data->ibuffer, info->index_data, index_data_size);
 
     data->vbuffer_view = alloc_descriptor(&r->bindless_heap);
     data->ibuffer_view = alloc_descriptor(&r->bindless_heap);
@@ -1401,15 +1412,17 @@ Mesh renderer_new_mesh(Renderer* r, RendererUploadContext* upload_context, Verte
     srv_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
-    srv_desc.Buffer.NumElements = vertex_count;
+    srv_desc.Buffer.NumElements = info->vertex_count;
     srv_desc.Buffer.StructureByteStride = sizeof(Vertex);
     r->device->CreateShaderResourceView(data->vbuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, data->vbuffer_view));
 
-    srv_desc.Buffer.NumElements = index_count;
+    srv_desc.Buffer.NumElements = info->index_count;
     srv_desc.Buffer.StructureByteStride = sizeof(u32);
     r->device->CreateShaderResourceView(data->ibuffer, &srv_desc, cpu_descriptor_handle(&r->bindless_heap, data->ibuffer_view));
 
-    data->index_count = index_count;
+    data->index_count = info->index_count;
+
+    data->aabb_cbuffer = get_constant_buffer(r, &info->aabb, sizeof(AABB));
 
     Mesh mesh = {};
     mesh.handle = handle;
@@ -1422,8 +1435,11 @@ void renderer_free_mesh(Renderer* r, Mesh mesh) {
 
     MeshData* data = resource_pool_access(r->mesh_pool, mesh.handle, MeshData);
 
+    immediate_drop_constant_buffer(r, data->aabb_cbuffer);
+
     free_descriptor(&r->bindless_heap, data->ibuffer_view);
     free_descriptor(&r->bindless_heap, data->vbuffer_view);
+
     data->ibuffer->Release();
     data->vbuffer->Release();
 
